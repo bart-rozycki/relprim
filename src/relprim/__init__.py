@@ -1,4 +1,10 @@
-from relprim.errors import OperationTimeoutError, RelPrimError, RetryError
+from relprim.errors import (
+    OperationExecutionError,
+    OperationTimeoutError,
+    RelPrimError,
+    RetryError,
+)
+from relprim.operation import AsyncOperation, async_operation
 from relprim.report import (
     AttemptStatus,
     ExecutionAttempt,
@@ -11,12 +17,14 @@ from relprim.retry import ExponentialBackoff, RetryAttempt, RetryPolicy
 from relprim.timeout import TimeoutPolicy
 
 __all__ = [
+    "AsyncOperation",
     "AttemptStatus",
     "ExecutionAttempt",
     "ExecutionError",
     "ExecutionReport",
     "ExecutionStatus",
     "ExponentialBackoff",
+    "OperationExecutionError",
     "OperationResult",
     "OperationTimeoutError",
     "RelPrimError",
@@ -24,4 +32,5 @@ __all__ = [
     "RetryError",
     "RetryPolicy",
     "TimeoutPolicy",
+    "async_operation",
 ]

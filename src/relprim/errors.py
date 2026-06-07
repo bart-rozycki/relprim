@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+from relprim.report import ExecutionReport
+
+
 class RelPrimError(Exception):
     """Base exception for all RelPrim errors."""
 
@@ -23,4 +28,23 @@ class OperationTimeoutError(RelPrimError):
     ) -> None:
         super().__init__(message)
         self.timeout_seconds = timeout_seconds
+        self.cause = cause
+
+
+class OperationExecutionError(RelPrimError):
+    """Raised when a resilient operation fails.
+
+    The execution report is attached so callers can inspect attempts, duration,
+    retry count and the final failure reason without relying on logs.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        report: ExecutionReport,
+        cause: BaseException,
+    ) -> None:
+        super().__init__(message)
+        self.report = report
         self.cause = cause
