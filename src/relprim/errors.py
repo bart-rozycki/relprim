@@ -9,3 +9,18 @@ class RetryError(RelPrimError):
         super().__init__(message)
         self.attempts = attempts
         self.cause = cause
+
+
+class OperationTimeoutError(RelPrimError):
+    """Raised when an operation exceeds its configured timeout."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        timeout_seconds: float,
+        cause: BaseException | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.timeout_seconds = timeout_seconds
+        self.cause = cause
