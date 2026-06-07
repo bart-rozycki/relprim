@@ -1,8 +1,16 @@
 from relprim.errors import (
+    FallbackChainError,
     OperationExecutionError,
     OperationTimeoutError,
     RelPrimError,
     RetryError,
+)
+from relprim.fallback import (
+    FallbackCandidate,
+    FallbackChain,
+    FallbackPolicy,
+    FallbackResult,
+    fallback_chain,
 )
 from relprim.operation import AsyncOperation, async_operation
 from relprim.report import (
@@ -24,6 +32,11 @@ __all__ = [
     "ExecutionReport",
     "ExecutionStatus",
     "ExponentialBackoff",
+    "FallbackCandidate",
+    "FallbackChain",
+    "FallbackChainError",
+    "FallbackPolicy",
+    "FallbackResult",
     "OperationExecutionError",
     "OperationResult",
     "OperationTimeoutError",
@@ -33,4 +46,5 @@ __all__ = [
     "RetryPolicy",
     "TimeoutPolicy",
     "async_operation",
+    "fallback_chain",
 ]
