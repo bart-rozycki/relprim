@@ -1,0 +1,11 @@
+class RelPrimError(Exception):
+    """Base exception for all RelPrim errors."""
+
+
+class RetryError(RelPrimError):
+    """Raised when an operation fails after all retry attempts."""
+
+    def __init__(self, message: str, *, attempts: int, cause: BaseException) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+        self.cause = cause
