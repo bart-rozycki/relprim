@@ -22,10 +22,10 @@ pip install relprim
 import asyncio
 
 from relprim import (
-    ExponentialBackoff,
     RetryPolicy,
     TimeoutPolicy,
     async_operation,
+    fallback_chain,
 )
 
 
@@ -33,26 +33,31 @@ class TemporaryProviderError(Exception):
     pass
 
 
-async def call_external_provider(prompt: str) -> str:
+async def call_primary_provider(prompt: str) -> str:
     # Replace this with an OpenAI, Gemini, HTTP, payment or any other external call.
-    return f"Generated response for: {prompt}"
+    raise TemporaryProviderError("primary provider temporarily unavailable")
+
+
+async def call_fallback_provider(prompt: str) -> str:
+    # Replace this with a secondary provider, backup API or local implementation.
+    return f"Fallback response for: {prompt}"
 
 
 async def main() -> None:
     result = await (
-        async_operation("generate_response", call_external_provider)
+        async_operation("generate_response", call_primary_provider)
         .with_retry(
             RetryPolicy(
                 max_attempts=3,
                 retry_on=(TemporaryProviderError,),
-                backoff=ExponentialBackoff(
-                    base_delay_seconds=0.2,
-                    max_delay_seconds=2.0,
-                    jitter=True,
-                ),
             )
         )
         .with_timeout(TimeoutPolicy(seconds=10))
+        .with_fallbacks(
+            fallback_chain(
+                ("fallback_provider", call_fallback_provider),
+            )
+        )
         .run("Write a short product summary")
     )
 
@@ -63,18 +68,24 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-## Current Features
+## What RelPrim provides
+
+RelPrim focuses on reliability primitives for operations that cross process, network or provider boundaries.
+
+Current primitives:
 
 * Retry policies
+* Exponential backoff with jitter
 * Async timeout enforcement
+* Async fallback chains
+* Async resilient operation API
 * Structured execution reports
 * Operation results
 * Typed execution errors
 
-## Planned Features
+Planned primitives:
 
 * Circuit breakers
-* Fallback chains
 * Validation
 * Idempotency
 * Rate limit handling
