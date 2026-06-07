@@ -12,6 +12,7 @@ from relprim import (
     RetryPolicy,
     TimeoutPolicy,
     async_operation,
+    fallback_chain,
 )
 
 
@@ -223,3 +224,191 @@ def test_async_operation_rejects_empty_name() -> None:
 
     with pytest.raises(ValueError):
         async_operation(" ", operation)
+
+
+async def test_async_operation_uses_fallback_after_primary_failure() -> None:
+    async def primary() -> str:
+        raise TransientError("primary unavailable")
+
+    async def fallback() -> str:
+        return "fallback-result"
+
+    result = await (
+        async_operation("provider_call", primary)
+        .with_retry(retry_policy(max_attempts=1))
+        .with_fallbacks(
+            fallback_chain(
+                ("fallback", fallback),
+            )
+        )
+        .run()
+    )
+
+    assert result.value == "fallback-result"
+    assert result.succeeded is True
+    assert result.report.status is ExecutionStatus.SUCCEEDED
+    assert result.report.attempt_count == 2
+    assert result.report.metadata["fallback_used"] is True
+    assert result.report.metadata["fallback_failed"] is False
+    assert result.report.metadata["fallback_candidate_name"] == "fallback"
+    assert result.report.metadata["fallback_candidate_index"] == 0
+    assert result.report.metadata["fallback_failure_count"] == 0
+    assert result.report.attempts[0].status is AttemptStatus.FAILED
+    assert result.report.attempts[0].metadata["fallback_used"] is False
+    assert result.report.attempts[1].status is AttemptStatus.SUCCEEDED
+    assert result.report.attempts[1].metadata["fallback_used"] is True
+
+
+async def test_async_operation_uses_fallback_after_retry_exhaustion() -> None:
+    attempts = 0
+
+    async def primary() -> str:
+        nonlocal attempts
+        attempts += 1
+        raise TransientError("primary unavailable")
+
+    async def fallback() -> str:
+        return "fallback-result"
+
+    result = await (
+        async_operation("provider_call", primary)
+        .with_retry(retry_policy(max_attempts=3))
+        .with_fallbacks(
+            fallback_chain(
+                ("fallback", fallback),
+            )
+        )
+        .run()
+    )
+
+    assert result.value == "fallback-result"
+    assert attempts == 3
+    assert result.report.status is ExecutionStatus.SUCCEEDED
+    assert result.report.attempt_count == 4
+    assert result.report.metadata["fallback_used"] is True
+    assert result.report.metadata["fallback_failed"] is False
+    assert result.report.metadata["fallback_candidate_name"] == "fallback"
+    assert [attempt.status for attempt in result.report.attempts] == [
+        AttemptStatus.FAILED,
+        AttemptStatus.FAILED,
+        AttemptStatus.FAILED,
+        AttemptStatus.SUCCEEDED,
+    ]
+
+
+async def test_async_operation_fallback_chain_preserves_fallback_failure_count() -> None:
+    async def primary() -> str:
+        raise TransientError("primary unavailable")
+
+    async def first_fallback() -> str:
+        raise TransientError("first fallback unavailable")
+
+    async def second_fallback() -> str:
+        return "second-fallback-result"
+
+    result = await (
+        async_operation("provider_call", primary)
+        .with_retry(retry_policy(max_attempts=1))
+        .with_fallbacks(
+            fallback_chain(
+                ("first_fallback", first_fallback),
+                ("second_fallback", second_fallback),
+            )
+        )
+        .run()
+    )
+
+    assert result.value == "second-fallback-result"
+    assert result.report.status is ExecutionStatus.SUCCEEDED
+    assert result.report.metadata["fallback_used"] is True
+    assert result.report.metadata["fallback_failed"] is False
+    assert result.report.metadata["fallback_candidate_name"] == "second_fallback"
+    assert result.report.metadata["fallback_candidate_index"] == 1
+    assert result.report.metadata["fallback_failure_count"] == 1
+
+
+async def test_async_operation_raises_execution_error_when_primary_and_fallbacks_fail() -> None:
+    async def primary() -> str:
+        raise TransientError("primary unavailable")
+
+    async def fallback() -> str:
+        raise TransientError("fallback unavailable")
+
+    with pytest.raises(OperationExecutionError) as exc_info:
+        await (
+            async_operation("provider_call", primary)
+            .with_retry(retry_policy(max_attempts=1))
+            .with_fallbacks(
+                fallback_chain(
+                    ("fallback", fallback),
+                )
+            )
+            .run()
+        )
+
+    error = exc_info.value
+
+    assert error.report.status is ExecutionStatus.FAILED
+    assert error.report.attempt_count == 2
+    assert error.report.metadata["fallback_used"] is True
+    assert error.report.metadata["fallback_failed"] is True
+    assert error.report.metadata["fallback_failure_count"] == 1
+    assert error.report.attempts[0].status is AttemptStatus.FAILED
+    assert error.report.attempts[0].metadata["fallback_used"] is False
+    assert error.report.attempts[1].status is AttemptStatus.FAILED
+    assert error.report.attempts[1].metadata["fallback_used"] is True
+    assert error.report.last_error is not None
+    assert error.report.last_error.type == "FallbackChainError"
+
+
+async def test_async_operation_does_not_use_fallback_when_primary_succeeds() -> None:
+    fallback_called = False
+
+    async def primary() -> str:
+        return "primary-result"
+
+    async def fallback() -> str:
+        nonlocal fallback_called
+        fallback_called = True
+        return "fallback-result"
+
+    result = await (
+        async_operation("provider_call", primary)
+        .with_fallbacks(
+            fallback_chain(
+                ("fallback", fallback),
+            )
+        )
+        .run()
+    )
+
+    assert result.value == "primary-result"
+    assert fallback_called is False
+    assert result.report.status is ExecutionStatus.SUCCEEDED
+    assert result.report.attempt_count == 1
+    assert result.report.metadata["fallback_used"] is False
+
+
+async def test_async_operation_builder_preserves_fallbacks_across_policy_changes() -> None:
+    async def primary() -> str:
+        raise TransientError("primary unavailable")
+
+    async def fallback() -> str:
+        return "fallback-result"
+
+    operation = (
+        async_operation("provider_call", primary)
+        .with_fallbacks(
+            fallback_chain(
+                ("fallback", fallback),
+            )
+        )
+        .with_retry(retry_policy(max_attempts=1))
+        .with_timeout(TimeoutPolicy(seconds=1))
+    )
+
+    result = await operation.run()
+
+    assert result.value == "fallback-result"
+    assert result.report.metadata["fallback_used"] is True
+    assert result.report.metadata["fallback_candidate_name"] == "fallback"
