@@ -219,3 +219,6 @@ __marimo__/
 
 # MacOS
 .DS_Store
+
+# Jetbrains
+.idea
