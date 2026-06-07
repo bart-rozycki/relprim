@@ -6,6 +6,7 @@ from relprim.report import (
     ExecutionReport,
     ExecutionStatus,
 )
+from relprim.result import OperationResult
 from relprim.retry import ExponentialBackoff, RetryAttempt, RetryPolicy
 from relprim.timeout import TimeoutPolicy
 
@@ -16,6 +17,7 @@ __all__ = [
     "ExecutionReport",
     "ExecutionStatus",
     "ExponentialBackoff",
+    "OperationResult",
     "OperationTimeoutError",
     "RelPrimError",
     "RetryAttempt",
