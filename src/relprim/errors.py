@@ -48,3 +48,21 @@ class OperationExecutionError(RelPrimError):
         super().__init__(message)
         self.report = report
         self.cause = cause
+
+
+class FallbackChainError(RelPrimError):
+    """Raised when all fallback candidates fail.
+
+    The original exceptions are preserved so callers can inspect the full
+    failure path instead of only seeing the last error.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failures: tuple[BaseException, ...],
+    ) -> None:
+        super().__init__(message)
+        self.failures = failures
+        self.cause = failures[-1] if failures else None
