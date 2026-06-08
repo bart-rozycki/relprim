@@ -12,6 +12,14 @@ from relprim.errors import (
     RetryError,
     ValidationFailedError,
 )
+from relprim.events import (
+    EventEmitter,
+    EventSink,
+    EventType,
+    InMemoryEventSink,
+    NoopEventSink,
+    StructuredEvent,
+)
 from relprim.fallback import (
     FallbackCandidate,
     FallbackChain,
@@ -47,6 +55,9 @@ __all__ = [
     "CircuitBreakerOpenError",
     "CircuitBreakerSnapshot",
     "CircuitBreakerState",
+    "EventEmitter",
+    "EventSink",
+    "EventType",
     "ExecutionAttempt",
     "ExecutionError",
     "ExecutionReport",
@@ -57,6 +68,8 @@ __all__ = [
     "FallbackChainError",
     "FallbackPolicy",
     "FallbackResult",
+    "InMemoryEventSink",
+    "NoopEventSink",
     "OperationExecutionError",
     "OperationResult",
     "OperationTimeoutError",
@@ -64,6 +77,7 @@ __all__ = [
     "RetryAttempt",
     "RetryError",
     "RetryPolicy",
+    "StructuredEvent",
     "TimeoutPolicy",
     "ValidationFailedError",
     "ValidationPolicy",
