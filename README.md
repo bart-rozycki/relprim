@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/bart-rozycki/relprim/actions/workflows/ci.yml/badge.svg)](https://github.com/bart-rozycki/relprim/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/relprim.svg)](https://pypi.org/project/relprim/)
-[![Python versions](https://img.shields.io/pypi/pyversions/relprim.svg)](https://pypi.org/project/relprim/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://pypi.org/project/relprim/)
 [![License](https://img.shields.io/pypi/l/relprim.svg)](https://github.com/bart-rozycki/relprim/blob/main/LICENSE)
 
 Reliability primitives for external operations in Python.
@@ -19,7 +19,7 @@ RelPrim is currently in active development and APIs may change before the first 
 
 ```bash
 pip install relprim
-````
+```
 
 ## Why RelPrim?
 
@@ -129,18 +129,21 @@ Current primitives:
 * Async timeout enforcement
 * Async fallback chains
 * Async circuit breakers
+* Validation policies
+* Callable validators
+* Structured events
+* Event emitters
+* No-op event sink
+* In-memory event sink
 * Async resilient operation API
 * Structured execution reports
 * Operation results
 * Typed execution errors
-* Validation policies
-* Callable validators
 
 Planned primitives:
 
 * Idempotency
 * Rate limit handling
-* Structured events
 * JSON Schema validator adapter
 * Pydantic validator adapter
 * SQLite event store
@@ -163,6 +166,38 @@ Core principles:
 
 RelPrim does not try to become a workflow engine. It provides the reliability layer that can be used inside your application, worker, service or orchestration system.
 
+## Structured events
+
+RelPrim can emit structured lifecycle events from async operations.
+
+Events are opt-in. By default, operations do not emit events. When configured with an `EventEmitter`, an operation can emit events such as:
+
+* `operation.started`
+* `attempt.started`
+* `attempt.failed`
+* `retry.scheduled`
+* `validation.failed`
+* `fallback.started`
+* `operation.succeeded`
+
+```python
+from relprim import EventEmitter, InMemoryEventSink, async_operation
+
+event_sink = InMemoryEventSink()
+event_emitter = EventEmitter(sinks=(event_sink,))
+
+result = await (
+    async_operation("generate_response", call_provider)
+    .with_events(event_emitter)
+    .run("Write a short product summary")
+)
+
+for event in await event_sink.events():
+    print(event.to_dict())
+```
+
+Structured events are transport-agnostic. They can be sent to logs, in-memory sinks, SQLite stores, OpenTelemetry exporters or custom observability systems.
+
 ## Examples
 
 Practical examples are available in the [`examples`](examples) directory:
@@ -171,7 +206,8 @@ Practical examples are available in the [`examples`](examples) directory:
 * [`fallback_chain.py`](examples/fallback_chain.py) — primary provider failure with fallback execution
 * [`circuit_breaker.py`](examples/circuit_breaker.py) — circuit breaker protection with fallback behavior
 * [`validation.py`](examples/validation.py) — result validation with retry support
- 
+* [`structured_events.py`](examples/structured_events.py) — operation lifecycle events with retry and validation
+
 Run an example:
 
 ```bash
@@ -190,7 +226,7 @@ fallback_chain(
 )
 ```
 
-These names appear in execution reports and will later be used by structured events, persistent execution history and OpenTelemetry integration.
+These names appear in execution reports and structured events. They will also be used by persistent execution history and OpenTelemetry integration.
 
 Example report metadata:
 
@@ -209,17 +245,15 @@ Explicit names make production debugging easier. They also avoid relying on unst
 
 Near-term roadmap:
 
-* Validation primitives
-* Operation-level validation support
-* Structured event sink
-* In-memory event sink for tests and demos
 * SQLite execution/event store
 * OpenTelemetry exporter
+* JSON Schema validator adapter
+* Pydantic validator adapter
+* Idempotency helpers
+* Rate limit handling
 
 Later roadmap:
 
-* Idempotency keys
-* Rate limit handling
 * Provider-specific examples
 * HTTP integration examples
 * AI provider integration examples
@@ -239,6 +273,10 @@ RelPrim is not:
 * a replacement for Temporal, Airflow, Celery, LangChain or LangGraph
 
 It is a reliability SDK for external operations.
+
+## Maintainer
+
+Created and maintained by [Bart Rozycki](https://github.com/bart-rozycki).
 
 ## License
 
