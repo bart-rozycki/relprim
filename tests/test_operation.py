@@ -13,8 +13,11 @@ from relprim import (
     OperationExecutionError,
     RetryPolicy,
     TimeoutPolicy,
+    ValidationFailedError,
     async_operation,
     fallback_chain,
+    validation_policy,
+    validator,
 )
 
 
@@ -564,3 +567,216 @@ async def test_async_operation_builder_preserves_circuit_breaker_across_policy_c
     assert result.value == "ok"
     assert result.report.metadata["circuit_breaker_open"] is False
     assert snapshot.closed is True
+
+
+async def test_async_operation_validates_successful_result() -> None:
+    async def operation() -> str:
+        return "valid response"
+
+    result = await (
+        async_operation("provider_call", operation)
+        .with_validation(
+            validation_policy(
+                validator(
+                    "non_empty",
+                    lambda value: bool(value.strip()),
+                    message="Value must not be empty.",
+                )
+            )
+        )
+        .run()
+    )
+
+    assert result.value == "valid response"
+    assert result.report.status is ExecutionStatus.SUCCEEDED
+    assert result.report.metadata["validation_performed"] is True
+    assert result.report.metadata["validation_valid"] is True
+    assert result.report.metadata["validation_validator_name"] == "validation_policy"
+    assert result.report.metadata["validation_reason"] is None
+    assert result.report.last_attempt.metadata["validation_valid"] is True
+
+
+async def test_async_operation_raises_execution_error_when_validation_fails() -> None:
+    async def operation() -> str:
+        return " "
+
+    with pytest.raises(OperationExecutionError) as exc_info:
+        await (
+            async_operation("provider_call", operation)
+            .with_validation(
+                validation_policy(
+                    validator(
+                        "non_empty",
+                        lambda value: bool(value.strip()),
+                        message="Value must not be empty.",
+                    )
+                )
+            )
+            .run()
+        )
+
+    error = exc_info.value
+
+    assert isinstance(error.cause, ValidationFailedError)
+    assert error.report.status is ExecutionStatus.FAILED
+    assert error.report.attempt_count == 1
+    assert error.report.metadata["validation_performed"] is True
+    assert error.report.metadata["validation_valid"] is False
+    assert error.report.metadata["validation_validator_name"] == "non_empty"
+    assert error.report.metadata["validation_reason"] == "Value must not be empty."
+    assert error.report.last_error is not None
+    assert error.report.last_error.type == "ValidationFailedError"
+
+
+async def test_async_operation_retries_validation_failure_when_configured() -> None:
+    calls = 0
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+
+        if calls < 3:
+            return " "
+
+        return "valid response"
+
+    result = await (
+        async_operation("provider_call", operation)
+        .with_retry(
+            retry_policy(
+                max_attempts=3,
+                retry_on=(ValidationFailedError,),
+            )
+        )
+        .with_validation(
+            validation_policy(
+                validator(
+                    "non_empty",
+                    lambda value: bool(value.strip()),
+                    message="Value must not be empty.",
+                )
+            )
+        )
+        .run()
+    )
+
+    assert result.value == "valid response"
+    assert calls == 3
+    assert result.report.status is ExecutionStatus.SUCCEEDED
+    assert result.report.attempt_count == 3
+    assert result.report.retry_count == 2
+    assert result.report.attempts[0].metadata["validation_valid"] is False
+    assert result.report.attempts[1].metadata["validation_valid"] is False
+    assert result.report.attempts[2].metadata["validation_valid"] is True
+
+
+async def test_async_operation_uses_fallback_after_validation_failure() -> None:
+    async def primary() -> str:
+        return " "
+
+    async def fallback() -> str:
+        return "fallback response"
+
+    result = await (
+        async_operation("provider_call", primary)
+        .with_retry(
+            retry_policy(
+                max_attempts=1,
+                retry_on=(ValidationFailedError,),
+            )
+        )
+        .with_validation(
+            validation_policy(
+                validator(
+                    "non_empty",
+                    lambda value: bool(value.strip()),
+                    message="Value must not be empty.",
+                )
+            )
+        )
+        .with_fallbacks(
+            fallback_chain(
+                ("fallback", fallback),
+            )
+        )
+        .run()
+    )
+
+    assert result.value == "fallback response"
+    assert result.report.status is ExecutionStatus.SUCCEEDED
+    assert result.report.attempt_count == 2
+    assert result.report.metadata["fallback_used"] is True
+    assert result.report.metadata["validation_valid"] is True
+    assert result.report.attempts[0].metadata["validation_valid"] is False
+    assert result.report.attempts[1].metadata["fallback_used"] is True
+    assert result.report.attempts[1].metadata["validation_valid"] is True
+
+
+async def test_async_operation_raises_when_fallback_result_fails_validation() -> None:
+    async def primary() -> str:
+        raise TransientError("primary unavailable")
+
+    async def fallback() -> str:
+        return " "
+
+    with pytest.raises(OperationExecutionError) as exc_info:
+        await (
+            async_operation("provider_call", primary)
+            .with_retry(
+                retry_policy(
+                    max_attempts=1,
+                    retry_on=(TransientError,),
+                )
+            )
+            .with_validation(
+                validation_policy(
+                    validator(
+                        "non_empty",
+                        lambda value: bool(value.strip()),
+                        message="Value must not be empty.",
+                    )
+                )
+            )
+            .with_fallbacks(
+                fallback_chain(
+                    ("fallback", fallback),
+                )
+            )
+            .run()
+        )
+
+    error = exc_info.value
+
+    assert isinstance(error.cause, ValidationFailedError)
+    assert error.report.status is ExecutionStatus.FAILED
+    assert error.report.attempt_count == 2
+    assert error.report.metadata["fallback_used"] is True
+    assert error.report.metadata["fallback_failed"] is True
+    assert error.report.metadata["validation_valid"] is False
+    assert error.report.metadata["validation_validator_name"] == "non_empty"
+
+
+async def test_async_operation_builder_preserves_validation_across_policy_changes() -> None:
+    async def operation() -> str:
+        return "valid response"
+
+    configured_operation = (
+        async_operation("provider_call", operation)
+        .with_validation(
+            validation_policy(
+                validator(
+                    "non_empty",
+                    lambda value: bool(value.strip()),
+                    message="Value must not be empty.",
+                )
+            )
+        )
+        .with_retry(retry_policy(max_attempts=2))
+        .with_timeout(TimeoutPolicy(seconds=1))
+    )
+
+    result = await configured_operation.run()
+
+    assert result.value == "valid response"
+    assert result.report.metadata["validation_performed"] is True
+    assert result.report.metadata["validation_valid"] is True
