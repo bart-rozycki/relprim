@@ -8,8 +8,11 @@ from relprim import (
     AttemptStatus,
     CircuitBreaker,
     CircuitBreakerOpenError,
+    EventEmitter,
+    EventType,
     ExecutionStatus,
     ExponentialBackoff,
+    InMemoryEventSink,
     OperationExecutionError,
     RetryPolicy,
     TimeoutPolicy,
@@ -780,3 +783,223 @@ async def test_async_operation_builder_preserves_validation_across_policy_change
     assert result.value == "valid response"
     assert result.report.metadata["validation_performed"] is True
     assert result.report.metadata["validation_valid"] is True
+
+
+async def test_async_operation_emits_events_for_successful_operation() -> None:
+    sink = InMemoryEventSink()
+    emitter = EventEmitter(sinks=(sink,))
+
+    async def operation() -> str:
+        return "ok"
+
+    result = await async_operation("provider_call", operation).with_events(emitter).run()
+
+    events = await sink.events()
+
+    assert result.value == "ok"
+    assert [event.event_type for event in events] == [
+        EventType.OPERATION_STARTED,
+        EventType.ATTEMPT_STARTED,
+        EventType.ATTEMPT_SUCCEEDED,
+        EventType.OPERATION_SUCCEEDED,
+    ]
+    assert all(event.operation_name == "provider_call" for event in events)
+    assert events[-1].payload["attempt_count"] == 1
+    assert events[-1].payload["retry_count"] == 0
+
+
+async def test_async_operation_emits_events_for_retry_flow() -> None:
+    sink = InMemoryEventSink()
+    emitter = EventEmitter(sinks=(sink,))
+    calls = 0
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+
+        if calls < 2:
+            raise TransientError("temporary failure")
+
+        return "ok"
+
+    result = await (
+        async_operation("provider_call", operation)
+        .with_events(emitter)
+        .with_retry(retry_policy(max_attempts=2, retry_on=(TransientError,)))
+        .run()
+    )
+
+    events = await sink.events()
+
+    assert result.value == "ok"
+    assert [event.event_type for event in events] == [
+        EventType.OPERATION_STARTED,
+        EventType.ATTEMPT_STARTED,
+        EventType.ATTEMPT_FAILED,
+        EventType.RETRY_SCHEDULED,
+        EventType.ATTEMPT_STARTED,
+        EventType.ATTEMPT_SUCCEEDED,
+        EventType.OPERATION_SUCCEEDED,
+    ]
+    assert events[2].payload["error_type"] == "TransientError"
+    assert events[2].payload["retryable"] is True
+    assert events[3].payload["next_attempt_number"] == 2
+    assert events[-1].payload["retry_count"] == 1
+
+
+async def test_async_operation_emits_events_for_failed_operation() -> None:
+    sink = InMemoryEventSink()
+    emitter = EventEmitter(sinks=(sink,))
+
+    async def operation() -> str:
+        raise PermanentError("do not retry")
+
+    with pytest.raises(OperationExecutionError):
+        await async_operation("provider_call", operation).with_events(emitter).run()
+
+    events = await sink.events()
+
+    assert [event.event_type for event in events] == [
+        EventType.OPERATION_STARTED,
+        EventType.ATTEMPT_STARTED,
+        EventType.ATTEMPT_FAILED,
+        EventType.OPERATION_FAILED,
+    ]
+    assert events[2].payload["error_type"] == "PermanentError"
+    assert events[3].payload["attempt_count"] == 1
+    assert events[3].payload["error_type"] == "PermanentError"
+
+
+async def test_async_operation_emits_events_for_fallback_success() -> None:
+    sink = InMemoryEventSink()
+    emitter = EventEmitter(sinks=(sink,))
+
+    async def primary() -> str:
+        raise TransientError("primary unavailable")
+
+    async def fallback() -> str:
+        return "fallback-result"
+
+    result = await (
+        async_operation("provider_call", primary)
+        .with_events(emitter)
+        .with_retry(retry_policy(max_attempts=1, retry_on=(TransientError,)))
+        .with_fallbacks(
+            fallback_chain(
+                ("fallback", fallback),
+            )
+        )
+        .run()
+    )
+
+    events = await sink.events()
+
+    assert result.value == "fallback-result"
+    assert [event.event_type for event in events] == [
+        EventType.OPERATION_STARTED,
+        EventType.ATTEMPT_STARTED,
+        EventType.ATTEMPT_FAILED,
+        EventType.FALLBACK_STARTED,
+        EventType.FALLBACK_SUCCEEDED,
+        EventType.ATTEMPT_SUCCEEDED,
+        EventType.OPERATION_SUCCEEDED,
+    ]
+    assert events[4].payload["fallback_candidate_name"] == "fallback"
+    assert events[-1].payload["fallback_used"] is True
+
+
+async def test_async_operation_emits_events_for_validation_failure() -> None:
+    sink = InMemoryEventSink()
+    emitter = EventEmitter(sinks=(sink,))
+
+    async def operation() -> str:
+        return " "
+
+    with pytest.raises(OperationExecutionError):
+        await (
+            async_operation("provider_call", operation)
+            .with_events(emitter)
+            .with_validation(
+                validation_policy(
+                    validator(
+                        "non_empty",
+                        lambda value: bool(value.strip()),
+                        message="Value must not be empty.",
+                    )
+                )
+            )
+            .run()
+        )
+
+    events = await sink.events()
+
+    assert [event.event_type for event in events] == [
+        EventType.OPERATION_STARTED,
+        EventType.ATTEMPT_STARTED,
+        EventType.VALIDATION_FAILED,
+        EventType.ATTEMPT_FAILED,
+        EventType.OPERATION_FAILED,
+    ]
+    assert events[2].payload["validator_name"] == "non_empty"
+    assert events[2].payload["reason"] == "Value must not be empty."
+    assert events[3].payload["validation_valid"] is False
+
+
+async def test_async_operation_emits_events_for_validation_success() -> None:
+    sink = InMemoryEventSink()
+    emitter = EventEmitter(sinks=(sink,))
+
+    async def operation() -> str:
+        return "valid response"
+
+    result = await (
+        async_operation("provider_call", operation)
+        .with_events(emitter)
+        .with_validation(
+            validation_policy(
+                validator(
+                    "non_empty",
+                    lambda value: bool(value.strip()),
+                    message="Value must not be empty.",
+                )
+            )
+        )
+        .run()
+    )
+
+    events = await sink.events()
+
+    assert result.value == "valid response"
+    assert [event.event_type for event in events] == [
+        EventType.OPERATION_STARTED,
+        EventType.ATTEMPT_STARTED,
+        EventType.VALIDATION_SUCCEEDED,
+        EventType.ATTEMPT_SUCCEEDED,
+        EventType.OPERATION_SUCCEEDED,
+    ]
+    assert events[2].payload["validator_name"] == "validation_policy"
+    assert events[3].payload["validation_valid"] is True
+
+
+async def test_async_operation_builder_preserves_event_emitter_across_policy_changes() -> None:
+    sink = InMemoryEventSink()
+    emitter = EventEmitter(sinks=(sink,))
+
+    async def operation() -> str:
+        return "ok"
+
+    configured_operation = (
+        async_operation("provider_call", operation)
+        .with_events(emitter)
+        .with_retry(retry_policy(max_attempts=2))
+        .with_timeout(TimeoutPolicy(seconds=1))
+    )
+
+    result = await configured_operation.run()
+
+    events = await sink.events()
+
+    assert result.value == "ok"
+    assert events
+    assert events[0].event_type is EventType.OPERATION_STARTED
+    assert events[-1].event_type is EventType.OPERATION_SUCCEEDED

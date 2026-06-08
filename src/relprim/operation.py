@@ -14,6 +14,7 @@ from relprim.errors import (
     OperationTimeoutError,
     ValidationFailedError,
 )
+from relprim.events import EventEmitter, EventType
 from relprim.fallback import FallbackChain, FallbackResult
 from relprim.report import (
     AttemptStatus,
@@ -63,6 +64,7 @@ class AsyncOperation(Generic[P, R]):
     _fallback_chain: FallbackChain[P, R] | None = None
     _circuit_breaker: CircuitBreaker | None = None
     _validation_policy: ValidationPolicy[R] | None = None
+    _event_emitter: EventEmitter | None = None
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -78,6 +80,7 @@ class AsyncOperation(Generic[P, R]):
             _fallback_chain=self._fallback_chain,
             _circuit_breaker=self._circuit_breaker,
             _validation_policy=self._validation_policy,
+            _event_emitter=self._event_emitter,
         )
 
     def with_timeout(self, policy: TimeoutPolicy) -> AsyncOperation[P, R]:
@@ -90,6 +93,7 @@ class AsyncOperation(Generic[P, R]):
             _fallback_chain=self._fallback_chain,
             _circuit_breaker=self._circuit_breaker,
             _validation_policy=self._validation_policy,
+            _event_emitter=self._event_emitter,
         )
 
     def with_fallbacks(self, chain: FallbackChain[P, R]) -> AsyncOperation[P, R]:
@@ -102,6 +106,7 @@ class AsyncOperation(Generic[P, R]):
             _fallback_chain=chain,
             _circuit_breaker=self._circuit_breaker,
             _validation_policy=self._validation_policy,
+            _event_emitter=self._event_emitter,
         )
 
     def with_circuit_breaker(self, breaker: CircuitBreaker) -> AsyncOperation[P, R]:
@@ -114,6 +119,7 @@ class AsyncOperation(Generic[P, R]):
             _fallback_chain=self._fallback_chain,
             _circuit_breaker=breaker,
             _validation_policy=self._validation_policy,
+            _event_emitter=self._event_emitter,
         )
 
     def with_validation(self, policy: ValidationPolicy[R]) -> AsyncOperation[P, R]:
@@ -126,6 +132,20 @@ class AsyncOperation(Generic[P, R]):
             _fallback_chain=self._fallback_chain,
             _circuit_breaker=self._circuit_breaker,
             _validation_policy=policy,
+            _event_emitter=self._event_emitter,
+        )
+
+    def with_events(self, emitter: EventEmitter) -> AsyncOperation[P, R]:
+        """Return a new operation configured with a structured event emitter."""
+        return AsyncOperation(
+            name=self.name,
+            _operation=self._operation,
+            _retry_policy=self._retry_policy,
+            _timeout_policy=self._timeout_policy,
+            _fallback_chain=self._fallback_chain,
+            _circuit_breaker=self._circuit_breaker,
+            _validation_policy=self._validation_policy,
+            _event_emitter=emitter,
         )
 
     async def run(self, *args: P.args, **kwargs: P.kwargs) -> OperationResult[R]:
@@ -141,27 +161,80 @@ class AsyncOperation(Generic[P, R]):
         operation_started_monotonic = time.perf_counter()
         attempts: list[ExecutionAttempt] = []
 
+        await self._emit_event(
+            EventType.OPERATION_STARTED,
+            payload={
+                "retry_enabled": self._retry_policy is not None,
+                "timeout_enabled": self._timeout_policy is not None,
+                "fallback_enabled": self._fallback_chain is not None,
+                "circuit_breaker_enabled": self._circuit_breaker is not None,
+                "validation_enabled": self._validation_policy is not None,
+            },
+        )
+
         max_attempts = self._retry_policy.max_attempts if self._retry_policy is not None else 1
 
         for attempt_number in range(1, max_attempts + 1):
             attempt_started_at = _utc_now()
             attempt_started_monotonic = time.perf_counter()
 
+            await self._emit_event(
+                EventType.ATTEMPT_STARTED,
+                payload={
+                    "attempt_number": attempt_number,
+                    "max_attempts": max_attempts,
+                },
+            )
+
             try:
                 value, validation_metadata = await self._run_single_attempt(*args, **kwargs)
             except Exception as exc:
                 attempt_status = self._attempt_status_for_exception(exc)
                 retryable = self._is_retryable(exc)
+                attempt_duration = _elapsed_seconds(attempt_started_monotonic)
+                failure_metadata = self._primary_failure_metadata(exc)
+
+                if isinstance(exc, ValidationFailedError):
+                    await self._emit_event(
+                        EventType.VALIDATION_FAILED,
+                        payload={
+                            "attempt_number": attempt_number,
+                            "validator_name": exc.validator_name,
+                            "reason": exc.reason,
+                        },
+                    )
+
+                if isinstance(exc, CircuitBreakerOpenError):
+                    await self._emit_event(
+                        EventType.CIRCUIT_BREAKER_REJECTED,
+                        payload={
+                            "attempt_number": attempt_number,
+                            "breaker_name": exc.breaker_name,
+                            "state": exc.state,
+                            "retry_after_seconds": exc.retry_after_seconds,
+                        },
+                    )
 
                 attempts.append(
                     ExecutionAttempt(
                         attempt_number=attempt_number,
                         status=attempt_status,
                         started_at=attempt_started_at,
-                        duration_seconds=_elapsed_seconds(attempt_started_monotonic),
+                        duration_seconds=attempt_duration,
                         error=ExecutionError.from_exception(exc, retryable=retryable),
-                        metadata=self._primary_failure_metadata(exc),
+                        metadata=failure_metadata,
                     )
+                )
+
+                await self._emit_event(
+                    EventType.ATTEMPT_FAILED,
+                    payload={
+                        "attempt_number": attempt_number,
+                        "duration_seconds": attempt_duration,
+                        "error_type": exc.__class__.__name__,
+                        "retryable": retryable,
+                        **failure_metadata,
+                    },
                 )
 
                 final_primary_failure = (not retryable) or attempt_number >= max_attempts
@@ -175,24 +248,65 @@ class AsyncOperation(Generic[P, R]):
                     fallback_started_at = _utc_now()
                     fallback_started_monotonic = time.perf_counter()
 
+                    await self._emit_event(
+                        EventType.FALLBACK_STARTED,
+                        payload={
+                            "attempt_number": fallback_attempt_number,
+                            "after_primary_attempts": len(attempts),
+                        },
+                    )
+
                     try:
                         fallback_result = await self._fallback_chain.run(*args, **kwargs)
                         fallback_validation_metadata = self._validate_value(fallback_result.value)
                     except Exception as fallback_exc:
+                        fallback_duration = _elapsed_seconds(fallback_started_monotonic)
                         fallback_metadata = self._fallback_failure_metadata(fallback_exc)
+
+                        if isinstance(fallback_exc, ValidationFailedError):
+                            await self._emit_event(
+                                EventType.VALIDATION_FAILED,
+                                payload={
+                                    "attempt_number": fallback_attempt_number,
+                                    "validator_name": fallback_exc.validator_name,
+                                    "reason": fallback_exc.reason,
+                                    "fallback_used": True,
+                                },
+                            )
 
                         attempts.append(
                             ExecutionAttempt(
                                 attempt_number=fallback_attempt_number,
                                 status=self._attempt_status_for_exception(fallback_exc),
                                 started_at=fallback_started_at,
-                                duration_seconds=_elapsed_seconds(fallback_started_monotonic),
+                                duration_seconds=fallback_duration,
                                 error=ExecutionError.from_exception(
                                     fallback_exc,
                                     retryable=False,
                                 ),
                                 metadata=fallback_metadata,
                             )
+                        )
+
+                        await self._emit_event(
+                            EventType.FALLBACK_FAILED,
+                            payload={
+                                "attempt_number": fallback_attempt_number,
+                                "duration_seconds": fallback_duration,
+                                "error_type": fallback_exc.__class__.__name__,
+                                **fallback_metadata,
+                            },
+                        )
+
+                        await self._emit_event(
+                            EventType.ATTEMPT_FAILED,
+                            payload={
+                                "attempt_number": fallback_attempt_number,
+                                "duration_seconds": fallback_duration,
+                                "error_type": fallback_exc.__class__.__name__,
+                                "retryable": False,
+                                **fallback_metadata,
+                            },
                         )
 
                         report = self._build_report(
@@ -203,25 +317,67 @@ class AsyncOperation(Generic[P, R]):
                             metadata=fallback_metadata,
                         )
 
+                        await self._emit_event(
+                            EventType.OPERATION_FAILED,
+                            payload={
+                                "duration_seconds": report.duration_seconds,
+                                "attempt_count": report.attempt_count,
+                                "retry_count": report.retry_count,
+                                "error_type": fallback_exc.__class__.__name__,
+                                **fallback_metadata,
+                            },
+                        )
+
                         raise OperationExecutionError(
                             f"Operation '{self.name}' failed and fallback chain failed.",
                             report=report,
                             cause=fallback_exc,
                         ) from fallback_exc
 
+                    if fallback_validation_metadata["validation_performed"] is True:
+                        await self._emit_event(
+                            EventType.VALIDATION_SUCCEEDED,
+                            payload={
+                                "attempt_number": fallback_attempt_number,
+                                "validator_name": fallback_validation_metadata[
+                                    "validation_validator_name"
+                                ],
+                                "fallback_used": True,
+                            },
+                        )
+
                     fallback_metadata = self._fallback_success_metadata(
                         fallback_result,
                         validation_metadata=fallback_validation_metadata,
                     )
+                    fallback_duration = _elapsed_seconds(fallback_started_monotonic)
 
                     attempts.append(
                         ExecutionAttempt(
                             attempt_number=fallback_attempt_number,
                             status=AttemptStatus.SUCCEEDED,
                             started_at=fallback_started_at,
-                            duration_seconds=_elapsed_seconds(fallback_started_monotonic),
+                            duration_seconds=fallback_duration,
                             metadata=fallback_metadata,
                         )
+                    )
+
+                    await self._emit_event(
+                        EventType.FALLBACK_SUCCEEDED,
+                        payload={
+                            "attempt_number": fallback_attempt_number,
+                            "duration_seconds": fallback_duration,
+                            **fallback_metadata,
+                        },
+                    )
+
+                    await self._emit_event(
+                        EventType.ATTEMPT_SUCCEEDED,
+                        payload={
+                            "attempt_number": fallback_attempt_number,
+                            "duration_seconds": fallback_duration,
+                            **fallback_metadata,
+                        },
                     )
 
                     report = self._build_report(
@@ -232,6 +388,16 @@ class AsyncOperation(Generic[P, R]):
                         metadata=fallback_metadata,
                     )
 
+                    await self._emit_event(
+                        EventType.OPERATION_SUCCEEDED,
+                        payload={
+                            "duration_seconds": report.duration_seconds,
+                            "attempt_count": report.attempt_count,
+                            "retry_count": report.retry_count,
+                            **fallback_metadata,
+                        },
+                    )
+
                     return OperationResult(value=fallback_result.value, report=report)
 
                 report = self._build_report(
@@ -239,7 +405,18 @@ class AsyncOperation(Generic[P, R]):
                     started_at=operation_started_at,
                     started_monotonic=operation_started_monotonic,
                     attempts=attempts,
-                    metadata=self._primary_failure_metadata(exc),
+                    metadata=failure_metadata,
+                )
+
+                await self._emit_event(
+                    EventType.OPERATION_FAILED,
+                    payload={
+                        "duration_seconds": report.duration_seconds,
+                        "attempt_count": report.attempt_count,
+                        "retry_count": report.retry_count,
+                        "error_type": exc.__class__.__name__,
+                        **failure_metadata,
+                    },
                 )
 
                 raise OperationExecutionError(
@@ -248,14 +425,35 @@ class AsyncOperation(Generic[P, R]):
                     cause=exc,
                 ) from exc
 
+            if validation_metadata["validation_performed"] is True:
+                await self._emit_event(
+                    EventType.VALIDATION_SUCCEEDED,
+                    payload={
+                        "attempt_number": attempt_number,
+                        "validator_name": validation_metadata["validation_validator_name"],
+                    },
+                )
+
+            attempt_duration = _elapsed_seconds(attempt_started_monotonic)
+            success_metadata = self._primary_success_metadata(validation_metadata)
+
             attempts.append(
                 ExecutionAttempt(
                     attempt_number=attempt_number,
                     status=AttemptStatus.SUCCEEDED,
                     started_at=attempt_started_at,
-                    duration_seconds=_elapsed_seconds(attempt_started_monotonic),
-                    metadata=self._primary_success_metadata(validation_metadata),
+                    duration_seconds=attempt_duration,
+                    metadata=success_metadata,
                 )
+            )
+
+            await self._emit_event(
+                EventType.ATTEMPT_SUCCEEDED,
+                payload={
+                    "attempt_number": attempt_number,
+                    "duration_seconds": attempt_duration,
+                    **success_metadata,
+                },
             )
 
             report = self._build_report(
@@ -263,7 +461,17 @@ class AsyncOperation(Generic[P, R]):
                 started_at=operation_started_at,
                 started_monotonic=operation_started_monotonic,
                 attempts=attempts,
-                metadata=self._primary_success_metadata(validation_metadata),
+                metadata=success_metadata,
+            )
+
+            await self._emit_event(
+                EventType.OPERATION_SUCCEEDED,
+                payload={
+                    "duration_seconds": report.duration_seconds,
+                    "attempt_count": report.attempt_count,
+                    "retry_count": report.retry_count,
+                    **success_metadata,
+                },
             )
 
             return OperationResult(value=value, report=report)
@@ -300,12 +508,7 @@ class AsyncOperation(Generic[P, R]):
 
     def _validate_value(self, value: R) -> MutableMetadata:
         if self._validation_policy is None:
-            return {
-                "validation_performed": False,
-                "validation_valid": None,
-                "validation_validator_name": None,
-                "validation_reason": None,
-            }
+            return self._no_validation_metadata()
 
         result = self._validation_policy.validate(value)
 
@@ -325,6 +528,16 @@ class AsyncOperation(Generic[P, R]):
             raise RuntimeError("Retry sleep requested without retry policy.")
 
         delay = self._retry_policy.backoff.delay_for_retry(attempt_number)
+
+        await self._emit_event(
+            EventType.RETRY_SCHEDULED,
+            payload={
+                "attempt_number": attempt_number,
+                "next_attempt_number": attempt_number + 1,
+                "delay_seconds": delay,
+            },
+        )
+
         await self._retry_policy.async_sleeper(delay)
 
     def _is_retryable(self, exception: Exception) -> bool:
@@ -332,6 +545,21 @@ class AsyncOperation(Generic[P, R]):
             return False
 
         return isinstance(exception, self._retry_policy.retry_on)
+
+    async def _emit_event(
+        self,
+        event_type: EventType,
+        *,
+        payload: Mapping[str, MetadataValue] | None = None,
+    ) -> None:
+        if self._event_emitter is None:
+            return
+
+        await self._event_emitter.emit(
+            event_type,
+            operation_name=self.name,
+            payload=payload,
+        )
 
     @staticmethod
     def _attempt_status_for_exception(exception: Exception) -> AttemptStatus:
