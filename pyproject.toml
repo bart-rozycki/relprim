@@ -5,6 +5,16 @@ description = "Reliability primitives for Python applications."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+]
 
 [project.optional-dependencies]
 dev = [
