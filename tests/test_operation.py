@@ -6,6 +6,8 @@ import pytest
 
 from relprim import (
     AttemptStatus,
+    CircuitBreaker,
+    CircuitBreakerOpenError,
     ExecutionStatus,
     ExponentialBackoff,
     OperationExecutionError,
@@ -412,3 +414,153 @@ async def test_async_operation_builder_preserves_fallbacks_across_policy_changes
     assert result.value == "fallback-result"
     assert result.report.metadata["fallback_used"] is True
     assert result.report.metadata["fallback_candidate_name"] == "fallback"
+
+
+async def test_async_operation_uses_circuit_breaker() -> None:
+    breaker = CircuitBreaker(
+        name="provider",
+        failure_threshold=1,
+        record_failure_on=(TransientError,),
+    )
+
+    async def operation() -> str:
+        return "ok"
+
+    result = await async_operation("provider_call", operation).with_circuit_breaker(breaker).run()
+
+    snapshot = await breaker.snapshot()
+
+    assert result.value == "ok"
+    assert result.report.status is ExecutionStatus.SUCCEEDED
+    assert result.report.metadata["circuit_breaker_open"] is False
+    assert snapshot.closed is True
+
+
+async def test_async_operation_records_circuit_breaker_open_failure() -> None:
+    breaker = CircuitBreaker(
+        name="provider",
+        failure_threshold=1,
+        record_failure_on=(TransientError,),
+    )
+
+    async def operation() -> str:
+        raise TransientError("provider unavailable")
+
+    with pytest.raises(OperationExecutionError):
+        await async_operation("provider_call", operation).with_circuit_breaker(breaker).run()
+
+    with pytest.raises(OperationExecutionError) as exc_info:
+        await async_operation("provider_call", operation).with_circuit_breaker(breaker).run()
+
+    error = exc_info.value
+
+    assert isinstance(error.cause, CircuitBreakerOpenError)
+    assert error.report.status is ExecutionStatus.FAILED
+    assert error.report.attempt_count == 1
+    assert error.report.metadata["circuit_breaker_open"] is True
+    assert error.report.last_attempt.metadata["circuit_breaker_open"] is True
+    assert error.report.last_error is not None
+    assert error.report.last_error.type == "CircuitBreakerOpenError"
+
+
+async def test_async_operation_can_retry_until_circuit_breaker_opens() -> None:
+    breaker = CircuitBreaker(
+        name="provider",
+        failure_threshold=2,
+        record_failure_on=(TransientError,),
+    )
+
+    calls = 0
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+        raise TransientError("provider unavailable")
+
+    with pytest.raises(OperationExecutionError) as exc_info:
+        await (
+            async_operation("provider_call", operation)
+            .with_retry(
+                retry_policy(
+                    max_attempts=3,
+                    retry_on=(TransientError, CircuitBreakerOpenError),
+                )
+            )
+            .with_circuit_breaker(breaker)
+            .run()
+        )
+
+    error = exc_info.value
+
+    assert calls == 2
+    assert isinstance(error.cause, CircuitBreakerOpenError)
+    assert error.report.attempt_count == 3
+    assert [
+        attempt.error.type if attempt.error is not None else None
+        for attempt in error.report.attempts
+    ] == [
+        "TransientError",
+        "TransientError",
+        "CircuitBreakerOpenError",
+    ]
+    assert error.report.last_attempt.metadata["circuit_breaker_open"] is True
+
+
+async def test_async_operation_uses_fallback_when_circuit_breaker_is_open() -> None:
+    breaker = CircuitBreaker(
+        name="provider",
+        failure_threshold=1,
+        record_failure_on=(TransientError,),
+    )
+
+    async def primary() -> str:
+        raise TransientError("provider unavailable")
+
+    async def fallback() -> str:
+        return "fallback-result"
+
+    with pytest.raises(OperationExecutionError):
+        await async_operation("provider_call", primary).with_circuit_breaker(breaker).run()
+
+    result = await (
+        async_operation("provider_call", primary)
+        .with_circuit_breaker(breaker)
+        .with_fallbacks(
+            fallback_chain(
+                ("fallback", fallback),
+            )
+        )
+        .run()
+    )
+
+    assert result.value == "fallback-result"
+    assert result.report.status is ExecutionStatus.SUCCEEDED
+    assert result.report.metadata["fallback_used"] is True
+    assert result.report.metadata["fallback_candidate_name"] == "fallback"
+    assert result.report.attempts[0].metadata["circuit_breaker_open"] is True
+    assert result.report.attempts[1].metadata["fallback_used"] is True
+
+
+async def test_async_operation_builder_preserves_circuit_breaker_across_policy_changes() -> None:
+    breaker = CircuitBreaker(
+        name="provider",
+        failure_threshold=1,
+        record_failure_on=(TransientError,),
+    )
+
+    async def operation() -> str:
+        return "ok"
+
+    configured_operation = (
+        async_operation("provider_call", operation)
+        .with_circuit_breaker(breaker)
+        .with_retry(retry_policy(max_attempts=2))
+        .with_timeout(TimeoutPolicy(seconds=1))
+    )
+
+    result = await configured_operation.run()
+    snapshot = await breaker.snapshot()
+
+    assert result.value == "ok"
+    assert result.report.metadata["circuit_breaker_open"] is False
+    assert snapshot.closed is True

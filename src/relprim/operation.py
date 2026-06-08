@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Generic, ParamSpec, TypeAlias, TypeVar
 
-from relprim.errors import FallbackChainError, OperationExecutionError, OperationTimeoutError
+from relprim.circuit_breaker import CircuitBreaker
+from relprim.errors import (
+    CircuitBreakerOpenError,
+    FallbackChainError,
+    OperationExecutionError,
+    OperationTimeoutError,
+)
 from relprim.fallback import FallbackChain, FallbackResult
 from relprim.report import (
     AttemptStatus,
@@ -39,8 +45,9 @@ class AsyncOperation(Generic[P, R]):
     """Composable resilient execution wrapper for asynchronous operations.
 
     AsyncOperation is the first higher-level RelPrim API. It composes low-level
-    primitives such as retry, timeout and fallback policies, while returning an
-    OperationResult that contains both the business value and an execution report.
+    primitives such as retry, timeout, circuit breaker and fallback policies,
+    while returning an OperationResult that contains both the business value and
+    an execution report.
 
     This class intentionally does not know anything about AI providers, HTTP,
     payments, queues or storage. It operates on any async callable.
@@ -51,6 +58,7 @@ class AsyncOperation(Generic[P, R]):
     _retry_policy: RetryPolicy | None = None
     _timeout_policy: TimeoutPolicy | None = None
     _fallback_chain: FallbackChain[P, R] | None = None
+    _circuit_breaker: CircuitBreaker | None = None
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -64,6 +72,7 @@ class AsyncOperation(Generic[P, R]):
             _retry_policy=policy,
             _timeout_policy=self._timeout_policy,
             _fallback_chain=self._fallback_chain,
+            _circuit_breaker=self._circuit_breaker,
         )
 
     def with_timeout(self, policy: TimeoutPolicy) -> AsyncOperation[P, R]:
@@ -74,6 +83,7 @@ class AsyncOperation(Generic[P, R]):
             _retry_policy=self._retry_policy,
             _timeout_policy=policy,
             _fallback_chain=self._fallback_chain,
+            _circuit_breaker=self._circuit_breaker,
         )
 
     def with_fallbacks(self, chain: FallbackChain[P, R]) -> AsyncOperation[P, R]:
@@ -84,6 +94,18 @@ class AsyncOperation(Generic[P, R]):
             _retry_policy=self._retry_policy,
             _timeout_policy=self._timeout_policy,
             _fallback_chain=chain,
+            _circuit_breaker=self._circuit_breaker,
+        )
+
+    def with_circuit_breaker(self, breaker: CircuitBreaker) -> AsyncOperation[P, R]:
+        """Return a new operation configured with a circuit breaker."""
+        return AsyncOperation(
+            name=self.name,
+            _operation=self._operation,
+            _retry_policy=self._retry_policy,
+            _timeout_policy=self._timeout_policy,
+            _fallback_chain=self._fallback_chain,
+            _circuit_breaker=breaker,
         )
 
     async def run(self, *args: P.args, **kwargs: P.kwargs) -> OperationResult[R]:
@@ -118,86 +140,92 @@ class AsyncOperation(Generic[P, R]):
                         started_at=attempt_started_at,
                         duration_seconds=_elapsed_seconds(attempt_started_monotonic),
                         error=ExecutionError.from_exception(exc, retryable=retryable),
-                        metadata={"fallback_used": False},
+                        metadata=self._primary_failure_metadata(exc),
                     )
                 )
 
-                if not retryable or attempt_number >= max_attempts:
-                    if self._fallback_chain is not None:
-                        fallback_attempt_number = len(attempts) + 1
-                        fallback_started_at = _utc_now()
-                        fallback_started_monotonic = time.perf_counter()
+                final_primary_failure = (not retryable) or attempt_number >= max_attempts
 
-                        try:
-                            fallback_result = await self._fallback_chain.run(*args, **kwargs)
-                        except Exception as fallback_exc:
-                            metadata = self._fallback_failure_metadata(fallback_exc)
+                if not final_primary_failure:
+                    await self._sleep_before_retry(attempt_number)
+                    continue
 
-                            attempts.append(
-                                ExecutionAttempt(
-                                    attempt_number=fallback_attempt_number,
-                                    status=self._attempt_status_for_exception(fallback_exc),
-                                    started_at=fallback_started_at,
-                                    duration_seconds=_elapsed_seconds(fallback_started_monotonic),
-                                    error=ExecutionError.from_exception(
-                                        fallback_exc, retryable=False
-                                    ),
-                                    metadata=metadata,
-                                )
-                            )
+                if self._fallback_chain is not None:
+                    fallback_attempt_number = len(attempts) + 1
+                    fallback_started_at = _utc_now()
+                    fallback_started_monotonic = time.perf_counter()
 
-                            report = self._build_report(
-                                status=self._report_status_for_attempt_status(attempts[-1].status),
-                                started_at=operation_started_at,
-                                started_monotonic=operation_started_monotonic,
-                                attempts=attempts,
-                                metadata=metadata,
-                            )
-
-                            raise OperationExecutionError(
-                                f"Operation '{self.name}' failed and fallback chain failed.",
-                                report=report,
-                                cause=fallback_exc,
-                            ) from fallback_exc
-
-                        metadata = self._fallback_success_metadata(fallback_result)
+                    try:
+                        fallback_result = await self._fallback_chain.run(*args, **kwargs)
+                    except Exception as fallback_exc:
+                        fallback_metadata = self._fallback_failure_metadata(fallback_exc)
 
                         attempts.append(
                             ExecutionAttempt(
                                 attempt_number=fallback_attempt_number,
-                                status=AttemptStatus.SUCCEEDED,
+                                status=self._attempt_status_for_exception(fallback_exc),
                                 started_at=fallback_started_at,
                                 duration_seconds=_elapsed_seconds(fallback_started_monotonic),
-                                metadata=metadata,
+                                error=ExecutionError.from_exception(
+                                    fallback_exc,
+                                    retryable=False,
+                                ),
+                                metadata=fallback_metadata,
                             )
                         )
 
                         report = self._build_report(
-                            status=ExecutionStatus.SUCCEEDED,
+                            status=self._report_status_for_attempt_status(attempts[-1].status),
                             started_at=operation_started_at,
                             started_monotonic=operation_started_monotonic,
                             attempts=attempts,
-                            metadata=metadata,
+                            metadata=fallback_metadata,
                         )
 
-                        return OperationResult(value=fallback_result.value, report=report)
+                        raise OperationExecutionError(
+                            f"Operation '{self.name}' failed and fallback chain failed.",
+                            report=report,
+                            cause=fallback_exc,
+                        ) from fallback_exc
+
+                    fallback_metadata = self._fallback_success_metadata(fallback_result)
+
+                    attempts.append(
+                        ExecutionAttempt(
+                            attempt_number=fallback_attempt_number,
+                            status=AttemptStatus.SUCCEEDED,
+                            started_at=fallback_started_at,
+                            duration_seconds=_elapsed_seconds(fallback_started_monotonic),
+                            metadata=fallback_metadata,
+                        )
+                    )
 
                     report = self._build_report(
-                        status=self._report_status_for_attempt_status(attempt_status),
+                        status=ExecutionStatus.SUCCEEDED,
                         started_at=operation_started_at,
                         started_monotonic=operation_started_monotonic,
                         attempts=attempts,
-                        metadata={"fallback_used": False},
+                        metadata=fallback_metadata,
                     )
 
-                    raise OperationExecutionError(
-                        f"Operation '{self.name}' failed after {len(attempts)} attempt(s).",
-                        report=report,
-                        cause=exc,
-                    ) from exc
+                    return OperationResult(value=fallback_result.value, report=report)
 
-                await self._sleep_before_retry(attempt_number)
-                continue
+                report = self._build_report(
+                    status=self._report_status_for_attempt_status(attempt_status),
+                    started_at=operation_started_at,
+                    started_monotonic=operation_started_monotonic,
+                    attempts=attempts,
+                    metadata={
+                        "fallback_used": False,
+                        "circuit_breaker_open": isinstance(exc, CircuitBreakerOpenError),
+                    },
+                )
+
+                raise OperationExecutionError(
+                    f"Operation '{self.name}' failed after {len(attempts)} attempt(s).",
+                    report=report,
+                    cause=exc,
+                ) from exc
 
             attempts.append(
                 ExecutionAttempt(
@@ -205,7 +233,10 @@ class AsyncOperation(Generic[P, R]):
                     status=AttemptStatus.SUCCEEDED,
                     started_at=attempt_started_at,
                     duration_seconds=_elapsed_seconds(attempt_started_monotonic),
-                    metadata={"fallback_used": False},
+                    metadata={
+                        "fallback_used": False,
+                        "circuit_breaker_open": False,
+                    },
                 )
             )
 
@@ -214,7 +245,10 @@ class AsyncOperation(Generic[P, R]):
                 started_at=operation_started_at,
                 started_monotonic=operation_started_monotonic,
                 attempts=attempts,
-                metadata={"fallback_used": False},
+                metadata={
+                    "fallback_used": False,
+                    "circuit_breaker_open": False,
+                },
             )
 
             return OperationResult(value=value, report=report)
@@ -222,6 +256,20 @@ class AsyncOperation(Generic[P, R]):
         raise RuntimeError("AsyncOperation reached an invalid execution state.")
 
     async def _run_single_attempt(self, *args: P.args, **kwargs: P.kwargs) -> R:
+        if self._circuit_breaker is not None:
+            return await self._circuit_breaker.run_async(
+                self._run_single_attempt_without_circuit_breaker,
+                *args,
+                **kwargs,
+            )
+
+        return await self._run_single_attempt_without_circuit_breaker(*args, **kwargs)
+
+    async def _run_single_attempt_without_circuit_breaker(
+        self,
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> R:
         if self._timeout_policy is None:
             return await self._operation(*args, **kwargs)
 
@@ -258,6 +306,13 @@ class AsyncOperation(Generic[P, R]):
         return ExecutionStatus.FAILED
 
     @staticmethod
+    def _primary_failure_metadata(exception: Exception) -> dict[str, MetadataValue]:
+        return {
+            "fallback_used": False,
+            "circuit_breaker_open": isinstance(exception, CircuitBreakerOpenError),
+        }
+
+    @staticmethod
     def _fallback_success_metadata(result: FallbackResult[R]) -> dict[str, MetadataValue]:
         return {
             "fallback_used": True,
@@ -265,6 +320,7 @@ class AsyncOperation(Generic[P, R]):
             "fallback_candidate_name": result.candidate_name,
             "fallback_candidate_index": result.candidate_index,
             "fallback_failure_count": result.failure_count,
+            "circuit_breaker_open": False,
         }
 
     @staticmethod
@@ -275,6 +331,7 @@ class AsyncOperation(Generic[P, R]):
             "fallback_used": True,
             "fallback_failed": True,
             "fallback_failure_count": failure_count,
+            "circuit_breaker_open": isinstance(exception, CircuitBreakerOpenError),
         }
 
     def _build_report(
