@@ -57,6 +57,8 @@ from relprim import (
     TimeoutPolicy,
     async_operation,
     fallback_chain,
+    validation_policy,
+    validator,
 )
 
 
@@ -92,6 +94,15 @@ async def main() -> None:
             )
         )
         .with_timeout(TimeoutPolicy(seconds=10))
+        .with_validation(
+            validation_policy(
+                validator(
+                    "non_empty_response",
+                    lambda value: bool(value.strip()),
+                    message="Response must not be empty.",
+                )
+            )
+        )
         .with_fallbacks(
             fallback_chain(
                 ("fallback_provider", call_fallback_provider),
@@ -122,13 +133,16 @@ Current primitives:
 * Structured execution reports
 * Operation results
 * Typed execution errors
+* Validation policies
+* Callable validators
 
 Planned primitives:
 
-* Validation
 * Idempotency
 * Rate limit handling
 * Structured events
+* JSON Schema validator adapter
+* Pydantic validator adapter
 * SQLite event store
 * OpenTelemetry exporter
 
@@ -156,7 +170,8 @@ Practical examples are available in the [`examples`](examples) directory:
 * [`basic_resilience.py`](examples/basic_resilience.py) — retry, timeout and execution reports
 * [`fallback_chain.py`](examples/fallback_chain.py) — primary provider failure with fallback execution
 * [`circuit_breaker.py`](examples/circuit_breaker.py) — circuit breaker protection with fallback behavior
-
+* [`validation.py`](examples/validation.py) — result validation with retry support
+ 
 Run an example:
 
 ```bash
