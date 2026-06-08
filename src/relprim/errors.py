@@ -83,3 +83,18 @@ class CircuitBreakerOpenError(RelPrimError):
         self.breaker_name = breaker_name
         self.state = state
         self.retry_after_seconds = retry_after_seconds
+
+
+class ValidationFailedError(RelPrimError):
+    """Raised when value validation fails."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        validator_name: str,
+        reason: str,
+    ) -> None:
+        super().__init__(message)
+        self.validator_name = validator_name
+        self.reason = reason
