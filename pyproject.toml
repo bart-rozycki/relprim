@@ -5,6 +5,26 @@ description = "Reliability primitives for Python applications."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+authors = [
+    { name = "Bart Rozycki", email = "contact@bartrozycki.com" }
+]
+maintainers = [
+    { name = "Bart Rozycki", email = "contact@bartrozycki.com" }
+]
+keywords = [
+    "reliability",
+    "resilience",
+    "retry",
+    "timeout",
+    "fallback",
+    "circuit-breaker",
+    "validation",
+    "structured-events",
+    "asyncio",
+    "distributed-systems",
+    "external-apis",
+    "ai-workflows",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -49,3 +69,9 @@ packages = ["relprim"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+
+[project.urls]
+Homepage = "https://github.com/bart-rozycki/relprim"
+Repository = "https://github.com/bart-rozycki/relprim"
+Issues = "https://github.com/bart-rozycki/relprim/issues"
+Changelog = "https://github.com/bart-rozycki/relprim/releases"
