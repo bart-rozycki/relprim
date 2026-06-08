@@ -12,6 +12,7 @@ from relprim.errors import (
     FallbackChainError,
     OperationExecutionError,
     OperationTimeoutError,
+    ValidationFailedError,
 )
 from relprim.fallback import FallbackChain, FallbackResult
 from relprim.report import (
@@ -24,12 +25,14 @@ from relprim.report import (
 from relprim.result import OperationResult
 from relprim.retry import RetryPolicy
 from relprim.timeout import TimeoutPolicy
+from relprim.validation import ValidationPolicy, ValidationResult
 
 P = ParamSpec("P")
 R = TypeVar("R")
 
 MetadataValue: TypeAlias = str | int | float | bool | None
 Metadata: TypeAlias = Mapping[str, MetadataValue]
+MutableMetadata: TypeAlias = dict[str, MetadataValue]
 
 
 def _utc_now() -> datetime:
@@ -45,9 +48,9 @@ class AsyncOperation(Generic[P, R]):
     """Composable resilient execution wrapper for asynchronous operations.
 
     AsyncOperation is the first higher-level RelPrim API. It composes low-level
-    primitives such as retry, timeout, circuit breaker and fallback policies,
-    while returning an OperationResult that contains both the business value and
-    an execution report.
+    primitives such as retry, timeout, circuit breaker, fallback and validation
+    policies, while returning an OperationResult that contains both the business
+    value and an execution report.
 
     This class intentionally does not know anything about AI providers, HTTP,
     payments, queues or storage. It operates on any async callable.
@@ -59,6 +62,7 @@ class AsyncOperation(Generic[P, R]):
     _timeout_policy: TimeoutPolicy | None = None
     _fallback_chain: FallbackChain[P, R] | None = None
     _circuit_breaker: CircuitBreaker | None = None
+    _validation_policy: ValidationPolicy[R] | None = None
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -73,6 +77,7 @@ class AsyncOperation(Generic[P, R]):
             _timeout_policy=self._timeout_policy,
             _fallback_chain=self._fallback_chain,
             _circuit_breaker=self._circuit_breaker,
+            _validation_policy=self._validation_policy,
         )
 
     def with_timeout(self, policy: TimeoutPolicy) -> AsyncOperation[P, R]:
@@ -84,6 +89,7 @@ class AsyncOperation(Generic[P, R]):
             _timeout_policy=policy,
             _fallback_chain=self._fallback_chain,
             _circuit_breaker=self._circuit_breaker,
+            _validation_policy=self._validation_policy,
         )
 
     def with_fallbacks(self, chain: FallbackChain[P, R]) -> AsyncOperation[P, R]:
@@ -95,6 +101,7 @@ class AsyncOperation(Generic[P, R]):
             _timeout_policy=self._timeout_policy,
             _fallback_chain=chain,
             _circuit_breaker=self._circuit_breaker,
+            _validation_policy=self._validation_policy,
         )
 
     def with_circuit_breaker(self, breaker: CircuitBreaker) -> AsyncOperation[P, R]:
@@ -106,6 +113,19 @@ class AsyncOperation(Generic[P, R]):
             _timeout_policy=self._timeout_policy,
             _fallback_chain=self._fallback_chain,
             _circuit_breaker=breaker,
+            _validation_policy=self._validation_policy,
+        )
+
+    def with_validation(self, policy: ValidationPolicy[R]) -> AsyncOperation[P, R]:
+        """Return a new operation configured with result validation."""
+        return AsyncOperation(
+            name=self.name,
+            _operation=self._operation,
+            _retry_policy=self._retry_policy,
+            _timeout_policy=self._timeout_policy,
+            _fallback_chain=self._fallback_chain,
+            _circuit_breaker=self._circuit_breaker,
+            _validation_policy=policy,
         )
 
     async def run(self, *args: P.args, **kwargs: P.kwargs) -> OperationResult[R]:
@@ -128,7 +148,7 @@ class AsyncOperation(Generic[P, R]):
             attempt_started_monotonic = time.perf_counter()
 
             try:
-                value = await self._run_single_attempt(*args, **kwargs)
+                value, validation_metadata = await self._run_single_attempt(*args, **kwargs)
             except Exception as exc:
                 attempt_status = self._attempt_status_for_exception(exc)
                 retryable = self._is_retryable(exc)
@@ -157,6 +177,7 @@ class AsyncOperation(Generic[P, R]):
 
                     try:
                         fallback_result = await self._fallback_chain.run(*args, **kwargs)
+                        fallback_validation_metadata = self._validate_value(fallback_result.value)
                     except Exception as fallback_exc:
                         fallback_metadata = self._fallback_failure_metadata(fallback_exc)
 
@@ -188,7 +209,10 @@ class AsyncOperation(Generic[P, R]):
                             cause=fallback_exc,
                         ) from fallback_exc
 
-                    fallback_metadata = self._fallback_success_metadata(fallback_result)
+                    fallback_metadata = self._fallback_success_metadata(
+                        fallback_result,
+                        validation_metadata=fallback_validation_metadata,
+                    )
 
                     attempts.append(
                         ExecutionAttempt(
@@ -215,10 +239,7 @@ class AsyncOperation(Generic[P, R]):
                     started_at=operation_started_at,
                     started_monotonic=operation_started_monotonic,
                     attempts=attempts,
-                    metadata={
-                        "fallback_used": False,
-                        "circuit_breaker_open": isinstance(exc, CircuitBreakerOpenError),
-                    },
+                    metadata=self._primary_failure_metadata(exc),
                 )
 
                 raise OperationExecutionError(
@@ -233,10 +254,7 @@ class AsyncOperation(Generic[P, R]):
                     status=AttemptStatus.SUCCEEDED,
                     started_at=attempt_started_at,
                     duration_seconds=_elapsed_seconds(attempt_started_monotonic),
-                    metadata={
-                        "fallback_used": False,
-                        "circuit_breaker_open": False,
-                    },
+                    metadata=self._primary_success_metadata(validation_metadata),
                 )
             )
 
@@ -245,17 +263,18 @@ class AsyncOperation(Generic[P, R]):
                 started_at=operation_started_at,
                 started_monotonic=operation_started_monotonic,
                 attempts=attempts,
-                metadata={
-                    "fallback_used": False,
-                    "circuit_breaker_open": False,
-                },
+                metadata=self._primary_success_metadata(validation_metadata),
             )
 
             return OperationResult(value=value, report=report)
 
         raise RuntimeError("AsyncOperation reached an invalid execution state.")
 
-    async def _run_single_attempt(self, *args: P.args, **kwargs: P.kwargs) -> R:
+    async def _run_single_attempt(
+        self,
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> tuple[R, MutableMetadata]:
         if self._circuit_breaker is not None:
             return await self._circuit_breaker.run_async(
                 self._run_single_attempt_without_circuit_breaker,
@@ -269,11 +288,37 @@ class AsyncOperation(Generic[P, R]):
         self,
         *args: P.args,
         **kwargs: P.kwargs,
-    ) -> R:
+    ) -> tuple[R, MutableMetadata]:
         if self._timeout_policy is None:
-            return await self._operation(*args, **kwargs)
+            value = await self._operation(*args, **kwargs)
+        else:
+            value = await self._timeout_policy.run_async(self._operation, *args, **kwargs)
 
-        return await self._timeout_policy.run_async(self._operation, *args, **kwargs)
+        validation_metadata = self._validate_value(value)
+
+        return value, validation_metadata
+
+    def _validate_value(self, value: R) -> MutableMetadata:
+        if self._validation_policy is None:
+            return {
+                "validation_performed": False,
+                "validation_valid": None,
+                "validation_validator_name": None,
+                "validation_reason": None,
+            }
+
+        result = self._validation_policy.validate(value)
+
+        if result.valid:
+            return self._validation_success_metadata(result)
+
+        reason = result.reason or "Validation failed."
+
+        raise ValidationFailedError(
+            f"Validation failed in '{result.validator_name}': {reason}",
+            validator_name=result.validator_name,
+            reason=reason,
+        )
 
     async def _sleep_before_retry(self, attempt_number: int) -> None:
         if self._retry_policy is None:
@@ -306,15 +351,65 @@ class AsyncOperation(Generic[P, R]):
         return ExecutionStatus.FAILED
 
     @staticmethod
-    def _primary_failure_metadata(exception: Exception) -> dict[str, MetadataValue]:
+    def _validation_success_metadata(result: ValidationResult) -> MutableMetadata:
         return {
-            "fallback_used": False,
-            "circuit_breaker_open": isinstance(exception, CircuitBreakerOpenError),
+            "validation_performed": True,
+            "validation_valid": True,
+            "validation_validator_name": result.validator_name,
+            "validation_reason": None,
         }
 
     @staticmethod
-    def _fallback_success_metadata(result: FallbackResult[R]) -> dict[str, MetadataValue]:
+    def _validation_failure_metadata(exception: ValidationFailedError) -> MutableMetadata:
         return {
+            "validation_performed": True,
+            "validation_valid": False,
+            "validation_validator_name": exception.validator_name,
+            "validation_reason": exception.reason,
+        }
+
+    @staticmethod
+    def _no_validation_metadata() -> MutableMetadata:
+        return {
+            "validation_performed": False,
+            "validation_valid": None,
+            "validation_validator_name": None,
+            "validation_reason": None,
+        }
+
+    def _base_metadata(self, validation_metadata: Metadata | None = None) -> MutableMetadata:
+        metadata: MutableMetadata = {
+            "fallback_used": False,
+            "circuit_breaker_open": False,
+        }
+
+        if validation_metadata is None:
+            metadata.update(self._no_validation_metadata())
+        else:
+            metadata.update(validation_metadata)
+
+        return metadata
+
+    def _primary_success_metadata(self, validation_metadata: Metadata) -> MutableMetadata:
+        return self._base_metadata(validation_metadata)
+
+    def _primary_failure_metadata(self, exception: Exception) -> MutableMetadata:
+        metadata = self._base_metadata()
+
+        metadata["circuit_breaker_open"] = isinstance(exception, CircuitBreakerOpenError)
+
+        if isinstance(exception, ValidationFailedError):
+            metadata.update(self._validation_failure_metadata(exception))
+
+        return metadata
+
+    @staticmethod
+    def _fallback_success_metadata(
+        result: FallbackResult[R],
+        *,
+        validation_metadata: Metadata,
+    ) -> MutableMetadata:
+        metadata: MutableMetadata = {
             "fallback_used": True,
             "fallback_failed": False,
             "fallback_candidate_name": result.candidate_name,
@@ -322,17 +417,26 @@ class AsyncOperation(Generic[P, R]):
             "fallback_failure_count": result.failure_count,
             "circuit_breaker_open": False,
         }
+        metadata.update(validation_metadata)
 
-    @staticmethod
-    def _fallback_failure_metadata(exception: Exception) -> dict[str, MetadataValue]:
+        return metadata
+
+    def _fallback_failure_metadata(self, exception: Exception) -> MutableMetadata:
         failure_count = len(exception.failures) if isinstance(exception, FallbackChainError) else 0
 
-        return {
+        metadata: MutableMetadata = {
             "fallback_used": True,
             "fallback_failed": True,
             "fallback_failure_count": failure_count,
             "circuit_breaker_open": isinstance(exception, CircuitBreakerOpenError),
         }
+
+        if isinstance(exception, ValidationFailedError):
+            metadata.update(self._validation_failure_metadata(exception))
+        else:
+            metadata.update(self._no_validation_metadata())
+
+        return metadata
 
     def _build_report(
         self,
