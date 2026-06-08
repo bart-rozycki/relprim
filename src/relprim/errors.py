@@ -66,3 +66,20 @@ class FallbackChainError(RelPrimError):
         super().__init__(message)
         self.failures = failures
         self.cause = failures[-1] if failures else None
+
+
+class CircuitBreakerOpenError(RelPrimError):
+    """Raised when a circuit breaker rejects an operation."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        breaker_name: str,
+        state: str,
+        retry_after_seconds: float | None,
+    ) -> None:
+        super().__init__(message)
+        self.breaker_name = breaker_name
+        self.state = state
+        self.retry_after_seconds = retry_after_seconds
