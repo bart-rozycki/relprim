@@ -22,6 +22,7 @@ pip install relprim
 import asyncio
 
 from relprim import (
+    CircuitBreaker,
     RetryPolicy,
     TimeoutPolicy,
     async_operation,
@@ -44,8 +45,16 @@ async def call_fallback_provider(prompt: str) -> str:
 
 
 async def main() -> None:
+    circuit_breaker = CircuitBreaker(
+        name="primary_provider",
+        failure_threshold=3,
+        recovery_timeout_seconds=30,
+        record_failure_on=(TemporaryProviderError,),
+    )
+
     result = await (
         async_operation("generate_response", call_primary_provider)
+        .with_circuit_breaker(circuit_breaker)
         .with_retry(
             RetryPolicy(
                 max_attempts=3,
@@ -78,6 +87,7 @@ Current primitives:
 * Exponential backoff with jitter
 * Async timeout enforcement
 * Async fallback chains
+* Async circuit breakers
 * Async resilient operation API
 * Structured execution reports
 * Operation results
@@ -85,13 +95,26 @@ Current primitives:
 
 Planned primitives:
 
-* Circuit breakers
 * Validation
 * Idempotency
 * Rate limit handling
 * Structured events
 * SQLite event store
 * OpenTelemetry exporter
+
+## Why operation and fallback names matter
+
+RelPrim uses explicit operation and fallback names for observability.
+
+```python
+async_operation("generate_response", call_primary_provider)
+
+fallback_chain(
+    ("fallback_provider", call_fallback_provider),
+)
+```
+
+These names appear in execution reports and will later be used by structured events, persistent execution history and OpenTelemetry integration.
 
 ## What RelPrim is not
 
