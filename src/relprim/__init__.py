@@ -1,4 +1,10 @@
+from relprim.circuit_breaker import (
+    CircuitBreaker,
+    CircuitBreakerSnapshot,
+    CircuitBreakerState,
+)
 from relprim.errors import (
+    CircuitBreakerOpenError,
     FallbackChainError,
     OperationExecutionError,
     OperationTimeoutError,
@@ -27,6 +33,10 @@ from relprim.timeout import TimeoutPolicy
 __all__ = [
     "AsyncOperation",
     "AttemptStatus",
+    "CircuitBreaker",
+    "CircuitBreakerOpenError",
+    "CircuitBreakerSnapshot",
+    "CircuitBreakerState",
     "ExecutionAttempt",
     "ExecutionError",
     "ExecutionReport",
