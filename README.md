@@ -21,14 +21,13 @@ pip install relprim
 from relprim import resilient
 
 
-@resilient(retries=3, timeout=10)
-async def call_openai(prompt: str) -> str:
-    response = await client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[{"role": "user", "content": prompt}],
-    )
+async def call_gemini(prompt: str) -> str:
+    return await gemini_client.generate(prompt)
 
-    return response.choices[0].message.content
+
+@resilient(retries=3, timeout=10, fallback=call_gemini)
+async def call_openai(prompt: str) -> str:
+    return await openai_client.generate(prompt)
 
 
 result = await call_openai("Write a short product summary")
@@ -159,14 +158,15 @@ RelPrim does not try to become a workflow engine. It provides the reliability la
 
 RelPrim is not:
 
+* an AI provider SDK
+* an HTTP client
 * a workflow engine
-* an agent framework
 * a task queue
-* a chatbot framework
-* an AI provider wrapper
-* a replacement for Temporal, Airflow, Celery, LangChain or LangGraph
+* an observability backend
+* a replacement for provider-native SDKs
+* a replacement for Temporal, Celery or OpenTelemetry
 
-It is a reliability SDK for external operations.
+It is a reliability layer for external operations.
 
 ## Maintainer
 
