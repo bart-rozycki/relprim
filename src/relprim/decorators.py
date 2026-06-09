@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from functools import wraps
-from typing import ParamSpec, TypeVar
+from typing import ParamSpec, TypeAlias, TypeVar
 
 from relprim.circuit_breaker import CircuitBreaker
 from relprim.events import EventEmitter
@@ -15,6 +15,9 @@ from relprim.validation import ValidationPolicy
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
+RetryOn: TypeAlias = tuple[type[Exception], ...]
+TimeoutConfig: TypeAlias = TimeoutPolicy | int | float | None
 
 
 def _operation_name_for(operation: Callable[P, Awaitable[R]]) -> str:
@@ -31,11 +34,56 @@ def _operation_name_for(operation: Callable[P, Awaitable[R]]) -> str:
     raise ValueError("operation name could not be inferred.")
 
 
+def _retry_policy_from(
+    *,
+    retry: RetryPolicy | None,
+    retries: int | None,
+    retry_on: RetryOn,
+) -> RetryPolicy | None:
+    if retry is not None and retries is not None:
+        raise ValueError("retry and retries cannot be used together.")
+
+    if retry is not None:
+        return retry
+
+    if retries is None:
+        return None
+
+    if retries < 0:
+        raise ValueError("retries must be greater than or equal to 0.")
+
+    if retries == 0:
+        return None
+
+    return RetryPolicy(
+        max_attempts=retries + 1,
+        retry_on=retry_on,
+    )
+
+
+def _timeout_policy_from(timeout: TimeoutConfig) -> TimeoutPolicy | None:
+    if timeout is None:
+        return None
+
+    if isinstance(timeout, TimeoutPolicy):
+        return timeout
+
+    if isinstance(timeout, bool) or not isinstance(timeout, int | float):
+        raise TypeError("timeout must be a TimeoutPolicy, int, float or None.")
+
+    if timeout <= 0:
+        raise ValueError("timeout must be greater than 0.")
+
+    return TimeoutPolicy(seconds=float(timeout))
+
+
 def resilient(
     *,
     name: str | None = None,
+    retries: int | None = None,
+    retry_on: RetryOn = (Exception,),
     retry: RetryPolicy | None = None,
-    timeout: TimeoutPolicy | None = None,
+    timeout: TimeoutConfig = None,
     fallbacks: FallbackChain[P, R] | None = None,
     circuit_breaker: CircuitBreaker | None = None,
     validation: ValidationPolicy[R] | None = None,
@@ -47,7 +95,12 @@ def resilient(
     execution metadata explicit and makes retries, fallbacks, validation and
     structured events observable by default.
 
-    Example:
+    Simple usage:
+        @resilient(retries=3, timeout=10)
+        async def call_provider(prompt: str) -> str:
+            ...
+
+    Advanced usage:
         @resilient(
             name="generate_response",
             retry=RetryPolicy(max_attempts=3),
@@ -55,13 +108,16 @@ def resilient(
         )
         async def generate_response(prompt: str) -> str:
             ...
-
-        result = await generate_response("Write a short product summary")
-        print(result.value)
-        print(result.report.to_dict())
     """
     if name is not None and not name.strip():
         raise ValueError("name must not be empty.")
+
+    retry_policy = _retry_policy_from(
+        retry=retry,
+        retries=retries,
+        retry_on=retry_on,
+    )
+    timeout_policy = _timeout_policy_from(timeout)
 
     def decorator(
         operation: Callable[P, Awaitable[R]],
@@ -76,11 +132,11 @@ def resilient(
         if circuit_breaker is not None:
             configured_operation = configured_operation.with_circuit_breaker(circuit_breaker)
 
-        if retry is not None:
-            configured_operation = configured_operation.with_retry(retry)
+        if retry_policy is not None:
+            configured_operation = configured_operation.with_retry(retry_policy)
 
-        if timeout is not None:
-            configured_operation = configured_operation.with_timeout(timeout)
+        if timeout_policy is not None:
+            configured_operation = configured_operation.with_timeout(timeout_policy)
 
         if validation is not None:
             configured_operation = configured_operation.with_validation(validation)

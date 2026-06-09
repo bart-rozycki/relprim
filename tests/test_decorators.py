@@ -261,3 +261,88 @@ async def test_resilient_decorator_supports_retry_validation_and_events_together
     assert EventType.VALIDATION_FAILED in [event.event_type for event in events]
     assert EventType.RETRY_SCHEDULED in [event.event_type for event in events]
     assert EventType.VALIDATION_SUCCEEDED in [event.event_type for event in events]
+
+
+async def test_resilient_decorator_accepts_simple_retries_option() -> None:
+    calls = 0
+
+    @resilient(
+        name="provider_call",
+        retries=2,
+        retry_on=(TransientError,),
+    )
+    async def provider() -> str:
+        nonlocal calls
+        calls += 1
+
+        if calls < 3:
+            raise TransientError("temporary failure")
+
+        return "ok"
+
+    result = await provider()
+
+    assert result.value == "ok"
+    assert calls == 3
+    assert result.report.attempt_count == 3
+    assert result.report.retry_count == 2
+
+
+async def test_resilient_decorator_accepts_simple_timeout_option() -> None:
+    @resilient(
+        name="provider_call",
+        timeout=10,
+    )
+    async def provider() -> str:
+        return "ok"
+
+    result = await provider()
+
+    assert result.value == "ok"
+    assert result.report.succeeded is True
+
+
+def test_resilient_decorator_rejects_retry_policy_and_simple_retries_together() -> None:
+    with pytest.raises(ValueError, match="retry and retries cannot be used together"):
+        resilient(
+            retry=RetryPolicy(max_attempts=2),
+            retries=2,
+        )
+
+
+def test_resilient_decorator_rejects_negative_retries() -> None:
+    with pytest.raises(ValueError, match="retries must be greater than or equal to 0"):
+        resilient(retries=-1)
+
+
+def test_resilient_decorator_rejects_zero_or_negative_timeout() -> None:
+    with pytest.raises(ValueError, match="timeout must be greater than 0"):
+        resilient(timeout=0)
+
+    with pytest.raises(ValueError, match="timeout must be greater than 0"):
+        resilient(timeout=-1)
+
+
+def test_resilient_decorator_rejects_invalid_timeout_type() -> None:
+    with pytest.raises(TypeError, match="timeout must be a TimeoutPolicy"):
+        resilient(timeout="10")  # type: ignore[arg-type]
+
+
+async def test_resilient_decorator_allows_zero_retries_without_retry_policy() -> None:
+    calls = 0
+
+    @resilient(
+        name="provider_call",
+        retries=0,
+    )
+    async def provider() -> str:
+        nonlocal calls
+        calls += 1
+        return "ok"
+
+    result = await provider()
+
+    assert result.value == "ok"
+    assert calls == 1
+    assert result.report.attempt_count == 1
+    assert result.report.retry_count == 0
