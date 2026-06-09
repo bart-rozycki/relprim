@@ -5,125 +5,84 @@
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://pypi.org/project/relprim/)
 [![License](https://img.shields.io/pypi/l/relprim.svg)](https://github.com/bart-rozycki/relprim/blob/main/LICENSE)
 
-Reliability primitives for external operations in Python.
+Reliability primitives for operations that cross process, network or provider boundaries.
 
-RelPrim is a production resilience SDK that helps developers build reliable integrations with AI providers, APIs and external services.
+RelPrim helps you wrap external calls with retries, timeouts, fallbacks, validation, circuit breakers, execution reports and structured events.
 
-## Status
-
-🚧 Early development.
-
-RelPrim is currently in active development and APIs may change before the first stable release.
-
-## Installation
+## Install
 
 ```bash
 pip install relprim
 ```
 
-## Why RelPrim?
-
-Modern applications often depend on external systems:
-
-* AI providers
-* payment gateways
-* third-party APIs
-* internal services
-* data platforms
-* notification providers
-* storage systems
-
-These operations fail in predictable ways:
-
-* timeouts
-* transient errors
-* unstable providers
-* malformed responses
-* overloaded downstream systems
-* expensive or unreliable primary providers
-
-RelPrim provides small, composable reliability primitives for handling these failures explicitly.
-
-It is designed for engineers who want reliability behavior that is easy to read, test, observe and evolve.
-
-## Quickstart
+## Wrap an external call in seconds
 
 ```python
-import asyncio
+from relprim import resilient
 
-from relprim import (
-    CircuitBreaker,
-    RetryPolicy,
-    TimeoutPolicy,
-    async_operation,
-    fallback_chain,
-    validation_policy,
-    validator,
+
+async def call_gemini(prompt: str) -> str:
+    return await gemini_client.generate(prompt)
+
+
+@resilient(retries=3, timeout=10, fallback=call_gemini)
+async def call_openai(prompt: str) -> str:
+    return await openai_client.generate(prompt)
+
+
+result = await call_openai("Write a short product summary")
+
+print(result.value)
+print(result.report.to_dict())
+```
+
+The decorated function returns an `OperationResult[T]`, not a raw value. This keeps the business result and the execution report explicit.
+
+## Why RelPrim?
+
+Most external calls start simple:
+
+```python
+response = await openai.chat.completions.create(...)
+```
+
+But production systems need to answer harder questions:
+
+* What if the provider times out?
+* What if the response is temporarily unavailable?
+* What if the provider returns an invalid response?
+* What if the primary provider is down?
+* What if you need a fallback provider?
+* What if you need to debug what happened after the fact?
+
+RelPrim gives you two levels of adoption.
+
+Beginner-friendly decorator API:
+
+```python
+@resilient(retries=3, timeout=10)
+async def call_provider(prompt: str) -> str:
+    return await provider.generate(prompt)
+```
+
+Advanced composition API:
+
+```python
+result = await (
+    async_operation("generate_response", call_provider)
+    .with_retry(RetryPolicy(max_attempts=3))
+    .with_timeout(TimeoutPolicy(seconds=10))
+    .with_validation(validation_policy(...))
+    .with_fallbacks(fallback_chain(("backup_provider", call_backup)))
+    .run(prompt)
 )
-
-
-class TemporaryProviderError(Exception):
-    pass
-
-
-async def call_primary_provider(prompt: str) -> str:
-    # Replace this with an OpenAI, Gemini, HTTP, payment or any other external call.
-    raise TemporaryProviderError("primary provider temporarily unavailable")
-
-
-async def call_fallback_provider(prompt: str) -> str:
-    # Replace this with a secondary provider, backup API or local implementation.
-    return f"Fallback response for: {prompt}"
-
-
-async def main() -> None:
-    circuit_breaker = CircuitBreaker(
-        name="primary_provider",
-        failure_threshold=3,
-        recovery_timeout_seconds=30,
-        record_failure_on=(TemporaryProviderError,),
-    )
-
-    result = await (
-        async_operation("generate_response", call_primary_provider)
-        .with_circuit_breaker(circuit_breaker)
-        .with_retry(
-            RetryPolicy(
-                max_attempts=3,
-                retry_on=(TemporaryProviderError,),
-            )
-        )
-        .with_timeout(TimeoutPolicy(seconds=10))
-        .with_validation(
-            validation_policy(
-                validator(
-                    "non_empty_response",
-                    lambda value: bool(value.strip()),
-                    message="Response must not be empty.",
-                )
-            )
-        )
-        .with_fallbacks(
-            fallback_chain(
-                ("fallback_provider", call_fallback_provider),
-            )
-        )
-        .run("Write a short product summary")
-    )
-
-    print(result.value)
-    print(result.report.to_dict())
-
-
-asyncio.run(main())
 ```
 
 ## What RelPrim provides
 
-RelPrim focuses on reliability primitives for operations that cross process, network or provider boundaries.
-
 Current primitives:
 
+* Resilient decorator API
 * Retry policies
 * Exponential backoff with jitter
 * Async timeout enforcement
@@ -135,19 +94,48 @@ Current primitives:
 * Event emitters
 * No-op event sink
 * In-memory event sink
-* Async resilient operation API
+* Async operation builder API
 * Structured execution reports
 * Operation results
 * Typed execution errors
 
 Planned primitives:
 
-* Idempotency
+* SQLite event store
+* OpenTelemetry exporter
+* Idempotency helpers
 * Rate limit handling
 * JSON Schema validator adapter
 * Pydantic validator adapter
-* SQLite event store
-* OpenTelemetry exporter
+
+## Examples
+
+Practical examples are available in the [`examples`](examples) directory:
+
+* [`decorator_usage.py`](examples/decorator_usage.py) — beginner-friendly decorator API
+* [`basic_resilience.py`](examples/basic_resilience.py) — retry, timeout and execution reports
+* [`fallback_chain.py`](examples/fallback_chain.py) — primary provider failure with fallback execution
+* [`circuit_breaker.py`](examples/circuit_breaker.py) — circuit breaker protection with fallback behavior
+* [`validation.py`](examples/validation.py) — result validation with retry support
+* [`structured_events.py`](examples/structured_events.py) — operation lifecycle events with retry and validation
+
+If you run examples from a cloned repository, install RelPrim in editable mode first:
+
+```bash
+python -m pip install -e ".[dev]"
+python examples/decorator_usage.py
+```
+
+Or run a single example without installing the package:
+
+```bash
+PYTHONPATH=src python examples/decorator_usage.py
+```
+
+## Documentation
+
+* [Getting started](docs/getting-started.md)
+* [Advanced usage](docs/advanced-usage.md)
 
 ## Design principles
 
@@ -166,113 +154,19 @@ Core principles:
 
 RelPrim does not try to become a workflow engine. It provides the reliability layer that can be used inside your application, worker, service or orchestration system.
 
-## Structured events
-
-RelPrim can emit structured lifecycle events from async operations.
-
-Events are opt-in. By default, operations do not emit events. When configured with an `EventEmitter`, an operation can emit events such as:
-
-* `operation.started`
-* `attempt.started`
-* `attempt.failed`
-* `retry.scheduled`
-* `validation.failed`
-* `fallback.started`
-* `operation.succeeded`
-
-```python
-from relprim import EventEmitter, InMemoryEventSink, async_operation
-
-event_sink = InMemoryEventSink()
-event_emitter = EventEmitter(sinks=(event_sink,))
-
-result = await (
-    async_operation("generate_response", call_provider)
-    .with_events(event_emitter)
-    .run("Write a short product summary")
-)
-
-for event in await event_sink.events():
-    print(event.to_dict())
-```
-
-Structured events are transport-agnostic. They can be sent to logs, in-memory sinks, SQLite stores, OpenTelemetry exporters or custom observability systems.
-
-## Examples
-
-Practical examples are available in the [`examples`](examples) directory:
-
-* [`basic_resilience.py`](examples/basic_resilience.py) — retry, timeout and execution reports
-* [`fallback_chain.py`](examples/fallback_chain.py) — primary provider failure with fallback execution
-* [`circuit_breaker.py`](examples/circuit_breaker.py) — circuit breaker protection with fallback behavior
-* [`validation.py`](examples/validation.py) — result validation with retry support
-* [`structured_events.py`](examples/structured_events.py) — operation lifecycle events with retry and validation
-
-Run an example:
-
-```bash
-python examples/basic_resilience.py
-```
-
-## Why operation and fallback names matter
-
-RelPrim uses explicit operation and fallback names for observability.
-
-```python
-async_operation("generate_response", call_primary_provider)
-
-fallback_chain(
-    ("fallback_provider", call_fallback_provider),
-)
-```
-
-These names appear in execution reports and structured events. They will also be used by persistent execution history and OpenTelemetry integration.
-
-Example report metadata:
-
-```python
-{
-    "fallback_used": True,
-    "fallback_candidate_name": "fallback_provider",
-    "fallback_candidate_index": 0,
-    "circuit_breaker_open": False,
-}
-```
-
-Explicit names make production debugging easier. They also avoid relying on unstable function names like `call`, `run`, `handler` or `invoke`.
-
-## Roadmap
-
-Near-term roadmap:
-
-* SQLite execution/event store
-* OpenTelemetry exporter
-* JSON Schema validator adapter
-* Pydantic validator adapter
-* Idempotency helpers
-* Rate limit handling
-
-Later roadmap:
-
-* Provider-specific examples
-* HTTP integration examples
-* AI provider integration examples
-* CLI inspection tools
-
-RelPrim will stay focused on reliability primitives. Provider adapters and workflow-style APIs may be added later only if they do not compromise the core model.
-
 ## What RelPrim is not
 
 RelPrim is not:
 
+* an AI provider SDK
+* an HTTP client
 * a workflow engine
-* an agent framework
 * a task queue
-* a chatbot framework
-* an AI provider wrapper
-* a replacement for Temporal, Airflow, Celery, LangChain or LangGraph
+* an observability backend
+* a replacement for provider-native SDKs
+* a replacement for Temporal, Celery or OpenTelemetry
 
-It is a reliability SDK for external operations.
+It is a reliability layer for external operations.
 
 ## Maintainer
 
