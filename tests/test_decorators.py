@@ -346,3 +346,53 @@ async def test_resilient_decorator_allows_zero_retries_without_retry_policy() ->
     assert calls == 1
     assert result.report.attempt_count == 1
     assert result.report.retry_count == 0
+
+
+async def test_resilient_decorator_accepts_simple_fallback_option() -> None:
+    async def backup_provider(prompt: str) -> str:
+        return f"backup response for: {prompt}"
+
+    @resilient(
+        name="provider_call",
+        retries=0,
+        fallback=backup_provider,
+    )
+    async def provider(prompt: str) -> str:
+        raise PermanentError("primary unavailable")
+
+    result = await provider("hello")
+
+    assert result.value == "backup response for: hello"
+    assert result.report.metadata["fallback_used"] is True
+    assert result.report.metadata["fallback_candidate_name"] == "backup_provider"
+    assert result.report.attempt_count == 2
+
+
+def test_resilient_decorator_rejects_fallback_and_fallbacks_together() -> None:
+    async def backup_provider() -> str:
+        return "backup"
+
+    with pytest.raises(ValueError, match="fallback and fallbacks cannot be used together"):
+        resilient(
+            fallback=backup_provider,
+            fallbacks=fallback_chain(
+                ("backup_provider", backup_provider),
+            ),
+        )
+
+
+async def test_resilient_decorator_uses_fallback_function_name_as_candidate_name() -> None:
+    async def gemini_provider(prompt: str) -> str:
+        return f"gemini response for: {prompt}"
+
+    @resilient(
+        name="openai_provider",
+        fallback=gemini_provider,
+    )
+    async def openai_provider(prompt: str) -> str:
+        raise PermanentError("openai unavailable")
+
+    result = await openai_provider("hello")
+
+    assert result.value == "gemini response for: hello"
+    assert result.report.metadata["fallback_candidate_name"] == "gemini_provider"
