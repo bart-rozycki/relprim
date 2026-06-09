@@ -18,6 +18,7 @@ R = TypeVar("R")
 
 RetryOn: TypeAlias = tuple[type[Exception], ...]
 TimeoutConfig: TypeAlias = TimeoutPolicy | int | float | None
+FallbackCallable: TypeAlias = Callable[P, Awaitable[R]]
 
 
 def _operation_name_for(operation: Callable[P, Awaitable[R]]) -> str:
@@ -77,6 +78,25 @@ def _timeout_policy_from(timeout: TimeoutConfig) -> TimeoutPolicy | None:
     return TimeoutPolicy(seconds=float(timeout))
 
 
+def _fallback_chain_from(
+    *,
+    fallback: FallbackCallable[P, R] | None,
+    fallbacks: FallbackChain[P, R] | None,
+) -> FallbackChain[P, R] | None:
+    if fallback is not None and fallbacks is not None:
+        raise ValueError("fallback and fallbacks cannot be used together.")
+
+    if fallbacks is not None:
+        return fallbacks
+
+    if fallback is None:
+        return None
+
+    return FallbackChain.from_operations(
+        (_operation_name_for(fallback), fallback),
+    )
+
+
 def resilient(
     *,
     name: str | None = None,
@@ -84,6 +104,7 @@ def resilient(
     retry_on: RetryOn = (Exception,),
     retry: RetryPolicy | None = None,
     timeout: TimeoutConfig = None,
+    fallback: FallbackCallable[P, R] | None = None,
     fallbacks: FallbackChain[P, R] | None = None,
     circuit_breaker: CircuitBreaker | None = None,
     validation: ValidationPolicy[R] | None = None,
@@ -96,7 +117,7 @@ def resilient(
     structured events observable by default.
 
     Simple usage:
-        @resilient(retries=3, timeout=10)
+        @resilient(retries=3, timeout=10, fallback=call_backup_provider)
         async def call_provider(prompt: str) -> str:
             ...
 
@@ -105,6 +126,10 @@ def resilient(
             name="generate_response",
             retry=RetryPolicy(max_attempts=3),
             timeout=TimeoutPolicy(seconds=10),
+            fallbacks=fallback_chain(
+                ("gemini_provider", call_gemini),
+                ("local_cache", call_cached_response),
+            ),
         )
         async def generate_response(prompt: str) -> str:
             ...
@@ -118,6 +143,10 @@ def resilient(
         retry_on=retry_on,
     )
     timeout_policy = _timeout_policy_from(timeout)
+    fallback_chain_policy = _fallback_chain_from(
+        fallback=fallback,
+        fallbacks=fallbacks,
+    )
 
     def decorator(
         operation: Callable[P, Awaitable[R]],
@@ -141,8 +170,8 @@ def resilient(
         if validation is not None:
             configured_operation = configured_operation.with_validation(validation)
 
-        if fallbacks is not None:
-            configured_operation = configured_operation.with_fallbacks(fallbacks)
+        if fallback_chain_policy is not None:
+            configured_operation = configured_operation.with_fallbacks(fallback_chain_policy)
 
         @wraps(operation)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> OperationResult[R]:
