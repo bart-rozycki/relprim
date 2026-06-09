@@ -3,6 +3,7 @@ from relprim.circuit_breaker import (
     CircuitBreakerSnapshot,
     CircuitBreakerState,
 )
+from relprim.decorators import resilient
 from relprim.errors import (
     CircuitBreakerOpenError,
     FallbackChainError,
@@ -87,4 +88,5 @@ __all__ = [
     "validator",
     "async_operation",
     "fallback_chain",
+    "resilient",
 ]
