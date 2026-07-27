@@ -7,6 +7,7 @@ from relprim.decorators import resilient
 from relprim.errors import (
     CircuitBreakerOpenError,
     FallbackChainError,
+    IdempotencyReentryError,
     OperationExecutionError,
     OperationTimeoutError,
     RelPrimError,
@@ -27,6 +28,14 @@ from relprim.fallback import (
     FallbackPolicy,
     FallbackResult,
     fallback_chain,
+)
+from relprim.idempotency import (
+    IdempotencyPolicy,
+    IdempotencyResult,
+    IdempotencyStatus,
+    IdempotencyStore,
+    InMemoryIdempotencyStore,
+    idempotency_policy,
 )
 from relprim.operation import AsyncOperation, async_operation
 from relprim.report import (
@@ -69,6 +78,12 @@ __all__ = [
     "FallbackChainError",
     "FallbackPolicy",
     "FallbackResult",
+    "IdempotencyPolicy",
+    "IdempotencyReentryError",
+    "IdempotencyResult",
+    "IdempotencyStatus",
+    "IdempotencyStore",
+    "InMemoryIdempotencyStore",
     "InMemoryEventSink",
     "NoopEventSink",
     "OperationExecutionError",
@@ -88,5 +103,6 @@ __all__ = [
     "validator",
     "async_operation",
     "fallback_chain",
+    "idempotency_policy",
     "resilient",
 ]
