@@ -24,6 +24,8 @@ keywords = [
     "distributed-systems",
     "external-apis",
     "ai-workflows",
+    "idempotency",
+    "deduplication",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

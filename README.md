@@ -78,6 +78,32 @@ result = await (
 )
 ```
 
+## Prevent duplicate executions
+
+RelPrim can deduplicate repeated or concurrent calls using an idempotency key.
+
+```python
+from relprim import resilient
+
+
+@resilient(
+    retries=2,
+    timeout=10,
+    idempotency_key=lambda request_id, amount: f"create-payment:{request_id}",
+    idempotency_ttl=3600,
+)
+async def create_payment(
+    request_id: str,
+    amount: int,
+) -> str:
+    return await payment_gateway.create(request_id, amount)
+```
+
+The first call executes the operation. Concurrent callers join the same execution, and later calls replay the successful result.
+
+The default store is in-memory and single-process. See the [idempotency guide](docs/idempotency.md) for concurrency semantics, key design and store limitations.
+
+
 ## What RelPrim provides
 
 Current primitives:
@@ -98,12 +124,15 @@ Current primitives:
 * Structured execution reports
 * Operation results
 * Typed execution errors
+* Idempotency policies
+* Concurrent execution joining
+* Successful result replay
+* In-memory idempotency store
 
 Planned primitives:
 
 * SQLite event store
 * OpenTelemetry exporter
-* Idempotency helpers
 * Rate limit handling
 * JSON Schema validator adapter
 * Pydantic validator adapter
@@ -118,6 +147,7 @@ Practical examples are available in the [`examples`](examples) directory:
 * [`circuit_breaker.py`](examples/circuit_breaker.py) — circuit breaker protection with fallback behavior
 * [`validation.py`](examples/validation.py) — result validation with retry support
 * [`structured_events.py`](examples/structured_events.py) — operation lifecycle events with retry and validation
+* [`idempotency.py`](examples/idempotency.py) — duplicate execution prevention and result replay
 
 If you run examples from a cloned repository, install RelPrim in editable mode first:
 
@@ -136,6 +166,7 @@ PYTHONPATH=src python examples/decorator_usage.py
 
 * [Getting started](docs/getting-started.md)
 * [Advanced usage](docs/advanced-usage.md)
+* [Idempotency](docs/idempotency.md)
 
 ## Design principles
 
