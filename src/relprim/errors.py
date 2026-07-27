@@ -98,3 +98,11 @@ class ValidationFailedError(RelPrimError):
         super().__init__(message)
         self.validator_name = validator_name
         self.reason = reason
+
+
+class IdempotencyReentryError(RelPrimError):
+    """Raised when an operation recursively uses the same idempotency key."""
+
+    def __init__(self, key: str) -> None:
+        super().__init__(f"Idempotency key '{key}' was reused recursively by its owning task.")
+        self.key = key
