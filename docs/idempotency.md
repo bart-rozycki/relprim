@@ -248,7 +248,6 @@ async def create_payment(
     request_id: str,
     amount_cents: int,
 ) -> str:
-    ...
 ```
 
 The builder API supports the same policy:
