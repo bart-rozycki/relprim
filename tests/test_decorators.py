@@ -5,12 +5,15 @@ import pytest
 from relprim import (
     EventEmitter,
     EventType,
+    IdempotencyStatus,
     InMemoryEventSink,
+    InMemoryIdempotencyStore,
     OperationExecutionError,
     RetryPolicy,
     TimeoutPolicy,
     ValidationFailedError,
     fallback_chain,
+    idempotency_policy,
     resilient,
     validation_policy,
     validator,
@@ -396,3 +399,223 @@ async def test_resilient_decorator_uses_fallback_function_name_as_candidate_name
 
     assert result.value == "gemini response for: hello"
     assert result.report.metadata["fallback_candidate_name"] == "gemini_provider"
+
+
+async def test_resilient_decorator_accepts_simple_idempotency_key() -> None:
+    store = InMemoryIdempotencyStore()
+    calls = 0
+
+    def request_key(request_id: str) -> str:
+        return request_id
+
+    @resilient(
+        name="create_payment",
+        idempotency_key=request_key,
+        idempotency_store=store,
+        idempotency_ttl=60,
+    )
+    async def create_payment(request_id: str) -> str:
+        nonlocal calls
+        calls += 1
+        return f"payment:{request_id}"
+
+    first = await create_payment("request-123")
+    second = await create_payment("request-123")
+
+    assert first.value == "payment:request-123"
+    assert second.value == "payment:request-123"
+    assert calls == 1
+
+    assert first.report.metadata["idempotency_status"] == IdempotencyStatus.EXECUTED.value
+    assert second.report.metadata["idempotency_status"] == IdempotencyStatus.REPLAYED.value
+    assert second.report.metadata["idempotency_cache_hit"] is True
+
+
+async def test_resilient_decorator_creates_default_idempotency_store() -> None:
+    calls = 0
+
+    def request_key(request_id: str) -> str:
+        return request_id
+
+    @resilient(
+        idempotency_key=request_key,
+    )
+    async def create_payment(request_id: str) -> str:
+        nonlocal calls
+        calls += 1
+        return f"payment:{request_id}"
+
+    first = await create_payment("request-123")
+    second = await create_payment("request-123")
+
+    assert first.value == "payment:request-123"
+    assert second.value == "payment:request-123"
+    assert calls == 1
+    assert second.report.metadata["idempotency_status"] == "replayed"
+
+
+async def test_resilient_decorator_executes_for_different_idempotency_keys() -> None:
+    store = InMemoryIdempotencyStore()
+    calls = 0
+
+    def request_key(request_id: str) -> str:
+        return request_id
+
+    @resilient(
+        idempotency_key=request_key,
+        idempotency_store=store,
+    )
+    async def create_payment(request_id: str) -> str:
+        nonlocal calls
+        calls += 1
+        return f"payment:{request_id}"
+
+    first = await create_payment("request-123")
+    second = await create_payment("request-456")
+
+    assert first.value == "payment:request-123"
+    assert second.value == "payment:request-456"
+    assert calls == 2
+
+
+async def test_resilient_decorator_accepts_explicit_idempotency_policy() -> None:
+    store = InMemoryIdempotencyStore()
+    calls = 0
+
+    def request_key(request_id: str) -> str:
+        return request_id
+
+    policy = idempotency_policy(
+        request_key,
+        store=store,
+        ttl_seconds=60,
+    )
+
+    @resilient(
+        name="create_payment",
+        idempotency=policy,
+    )
+    async def create_payment(request_id: str) -> str:
+        nonlocal calls
+        calls += 1
+        return f"payment:{request_id}"
+
+    first = await create_payment("request-123")
+    second = await create_payment("request-123")
+
+    assert first.value == "payment:request-123"
+    assert second.value == "payment:request-123"
+    assert calls == 1
+    assert first.report.metadata["idempotency_status"] == "executed"
+    assert second.report.metadata["idempotency_status"] == "replayed"
+
+
+async def test_resilient_decorator_idempotency_wraps_retry_flow() -> None:
+    store = InMemoryIdempotencyStore()
+    calls = 0
+
+    def request_key(request_id: str) -> str:
+        return request_id
+
+    @resilient(
+        retries=1,
+        retry_on=(TransientError,),
+        idempotency_key=request_key,
+        idempotency_store=store,
+    )
+    async def create_payment(request_id: str) -> str:
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            raise TransientError("temporary failure")
+
+        return f"payment:{request_id}"
+
+    first = await create_payment("request-123")
+    second = await create_payment("request-123")
+
+    assert first.value == "payment:request-123"
+    assert second.value == "payment:request-123"
+
+    assert calls == 2
+    assert first.report.attempt_count == 2
+    assert first.report.retry_count == 1
+    assert second.report.metadata["idempotency_status"] == "replayed"
+
+
+def test_resilient_decorator_rejects_conflicting_idempotency_configuration() -> None:
+    store = InMemoryIdempotencyStore()
+
+    def request_key(request_id: str) -> str:
+        return request_id
+
+    policy = idempotency_policy(
+        request_key,
+        store=store,
+    )
+
+    def define_operation() -> None:
+        @resilient(
+            idempotency=policy,
+            idempotency_key=request_key,
+        )
+        async def create_payment(request_id: str) -> str:
+            return f"payment:{request_id}"
+
+    with pytest.raises(
+        ValueError,
+        match="idempotency cannot be combined",
+    ):
+        define_operation()
+
+
+def test_resilient_decorator_rejects_idempotency_store_without_key() -> None:
+    store = InMemoryIdempotencyStore()
+
+    def define_operation() -> None:
+        @resilient(
+            idempotency_store=store,
+        )
+        async def create_payment(request_id: str) -> str:
+            return f"payment:{request_id}"
+
+    with pytest.raises(
+        ValueError,
+        match="idempotency_store and idempotency_ttl require idempotency_key",
+    ):
+        define_operation()
+
+
+def test_resilient_decorator_rejects_idempotency_ttl_without_key() -> None:
+    def define_operation() -> None:
+        @resilient(
+            idempotency_ttl=60,
+        )
+        async def create_payment(request_id: str) -> str:
+            return f"payment:{request_id}"
+
+    with pytest.raises(
+        ValueError,
+        match="idempotency_store and idempotency_ttl require idempotency_key",
+    ):
+        define_operation()
+
+
+def test_resilient_decorator_rejects_non_positive_idempotency_ttl() -> None:
+    def request_key(request_id: str) -> str:
+        return request_id
+
+    def define_operation() -> None:
+        @resilient(
+            idempotency_key=request_key,
+            idempotency_ttl=0,
+        )
+        async def create_payment(request_id: str) -> str:
+            return f"payment:{request_id}"
+
+    with pytest.raises(
+        ValueError,
+        match="ttl_seconds must be greater than 0",
+    ):
+        define_operation()
