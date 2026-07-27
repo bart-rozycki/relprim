@@ -7,6 +7,11 @@ from typing import ParamSpec, TypeAlias, TypeVar
 from relprim.circuit_breaker import CircuitBreaker
 from relprim.events import EventEmitter
 from relprim.fallback import FallbackChain
+from relprim.idempotency import (
+    IdempotencyPolicy,
+    IdempotencyStore,
+    idempotency_policy,
+)
 from relprim.operation import async_operation
 from relprim.result import OperationResult
 from relprim.retry import RetryPolicy
@@ -97,6 +102,41 @@ def _fallback_chain_from(
     )
 
 
+def _idempotency_policy_from(
+    *,
+    idempotency: IdempotencyPolicy[P] | None,
+    idempotency_key: Callable[P, str] | None,
+    idempotency_store: IdempotencyStore | None,
+    idempotency_ttl: float | None,
+) -> IdempotencyPolicy[P] | None:
+    simple_configuration_used = (
+        idempotency_key is not None or idempotency_store is not None or idempotency_ttl is not None
+    )
+
+    if idempotency is not None and simple_configuration_used:
+        raise ValueError(
+            "idempotency cannot be combined with idempotency_key, "
+            "idempotency_store or idempotency_ttl."
+        )
+
+    if idempotency is not None:
+        return idempotency
+
+    if idempotency_key is None:
+        if idempotency_store is not None or idempotency_ttl is not None:
+            raise ValueError("idempotency_store and idempotency_ttl require idempotency_key.")
+
+        return None
+
+    ttl_seconds = 3600.0 if idempotency_ttl is None else idempotency_ttl
+
+    return idempotency_policy(
+        idempotency_key,
+        store=idempotency_store,
+        ttl_seconds=ttl_seconds,
+    )
+
+
 def resilient(
     *,
     name: str | None = None,
@@ -109,29 +149,48 @@ def resilient(
     circuit_breaker: CircuitBreaker | None = None,
     validation: ValidationPolicy[R] | None = None,
     events: EventEmitter | None = None,
+    idempotency: IdempotencyPolicy[P] | None = None,
+    idempotency_key: Callable[P, str] | None = None,
+    idempotency_store: IdempotencyStore | None = None,
+    idempotency_ttl: float | None = None,
 ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[OperationResult[R]]]]:
     """Wrap an async callable in a resilient RelPrim operation.
 
     The decorated function returns OperationResult[T], not a raw value. This keeps
-    execution metadata explicit and makes retries, fallbacks, validation and
-    structured events observable by default.
+    execution metadata explicit and makes retries, fallbacks, validation,
+    idempotency and structured events observable.
 
     Simple usage:
-        @resilient(retries=3, timeout=10, fallback=call_backup_provider)
-        async def call_provider(prompt: str) -> str:
+        @resilient(
+            retries=3,
+            timeout=10,
+            fallback=call_backup_provider,
+            idempotency_key=lambda request_id, payload: request_id,
+        )
+        async def create_payment(
+            request_id: str,
+            payload: PaymentPayload,
+        ) -> Payment:
             ...
 
     Advanced usage:
         @resilient(
-            name="generate_response",
+            name="create_payment",
             retry=RetryPolicy(max_attempts=3),
             timeout=TimeoutPolicy(seconds=10),
             fallbacks=fallback_chain(
-                ("gemini_provider", call_gemini),
-                ("local_cache", call_cached_response),
+                ("backup_provider", call_backup_provider),
+            ),
+            idempotency=idempotency_policy(
+                lambda request_id, payload: request_id,
+                store=shared_store,
+                ttl_seconds=3600,
             ),
         )
-        async def generate_response(prompt: str) -> str:
+        async def create_payment(
+            request_id: str,
+            payload: PaymentPayload,
+        ) -> Payment:
             ...
     """
     if name is not None and not name.strip():
@@ -146,6 +205,12 @@ def resilient(
     fallback_chain_policy = _fallback_chain_from(
         fallback=fallback,
         fallbacks=fallbacks,
+    )
+    resolved_idempotency_policy = _idempotency_policy_from(
+        idempotency=idempotency,
+        idempotency_key=idempotency_key,
+        idempotency_store=idempotency_store,
+        idempotency_ttl=idempotency_ttl,
     )
 
     def decorator(
@@ -172,6 +237,11 @@ def resilient(
 
         if fallback_chain_policy is not None:
             configured_operation = configured_operation.with_fallbacks(fallback_chain_policy)
+
+        if resolved_idempotency_policy is not None:
+            configured_operation = configured_operation.with_idempotency(
+                resolved_idempotency_policy
+            )
 
         @wraps(operation)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> OperationResult[R]:
