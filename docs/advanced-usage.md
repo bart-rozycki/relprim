@@ -124,6 +124,39 @@ for event in await event_sink.events():
 
 Events are transport-agnostic. They can be sent to logs, in-memory sinks, SQLite stores, OpenTelemetry exporters or custom observability systems.
 
+## Idempotency
+
+Idempotency can coordinate the entire operation lifecycle under one logical key.
+
+```python
+from relprim import (
+    InMemoryIdempotencyStore,
+    RetryPolicy,
+    async_operation,
+    idempotency_policy,
+)
+
+
+store = InMemoryIdempotencyStore()
+
+payment_idempotency = idempotency_policy(
+    lambda request_id, amount: f"create-payment:{request_id}",
+    store=store,
+    ttl_seconds=3600,
+)
+
+result = await (
+    async_operation("create_payment", create_payment)
+    .with_retry(RetryPolicy(max_attempts=3))
+    .with_idempotency(payment_idempotency)
+    .run("request-123", 2499)
+)
+```
+Idempotency wraps the full retry, timeout, validation and fallback flow.
+
+The in-memory store is limited to one process. See the [idempotency guide](idempotency.md) for key design, concurrency semantics and storage limitations.
+
+
 ## Operation names
 
 RelPrim uses explicit operation names for observability.

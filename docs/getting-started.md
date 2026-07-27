@@ -40,6 +40,23 @@ result.report
 
 This keeps the business result and execution metadata explicit.
 
+## Prevent duplicate executions
+
+Use an idempotency key when the same logical request may be submitted more than once.
+
+```python
+@resilient(
+    retries=2,
+    timeout=10,
+    idempotency_key=lambda request_id, payload: f"process-request:{request_id}",
+    idempotency_ttl=3600,
+)
+async def process_request(
+    request_id: str,
+    payload: dict[str, object],
+) -> str:
+    return await external_service.process(payload)
+
 ## Retry only selected exceptions
 
 By default, simple retries use `Exception`.
@@ -62,6 +79,12 @@ class TemporaryProviderError(Exception):
 async def call_provider(prompt: str) -> str:
     return await provider.generate(prompt)
 ```
+
+The first call executes the operation. Concurrent duplicate calls join it, and later calls replay its successful result.
+
+The default store is in-memory and coordinates calls only within one Python process.
+
+See the [idempotency guide](idempotency.md) before using idempotency for multi-process or distributed systems.
 
 ## Validate provider responses
 
