@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Generic, ParamSpec, TypeAlias, TypeVar
 
@@ -16,6 +16,7 @@ from relprim.errors import (
 )
 from relprim.events import EventEmitter, EventType
 from relprim.fallback import FallbackChain, FallbackResult
+from relprim.idempotency import IdempotencyPolicy, IdempotencyResult
 from relprim.report import (
     AttemptStatus,
     ExecutionAttempt,
@@ -65,6 +66,7 @@ class AsyncOperation(Generic[P, R]):
     _circuit_breaker: CircuitBreaker | None = None
     _validation_policy: ValidationPolicy[R] | None = None
     _event_emitter: EventEmitter | None = None
+    _idempotency_policy: IdempotencyPolicy[P] | None = None
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -72,83 +74,55 @@ class AsyncOperation(Generic[P, R]):
 
     def with_retry(self, policy: RetryPolicy) -> AsyncOperation[P, R]:
         """Return a new operation configured with a retry policy."""
-        return AsyncOperation(
-            name=self.name,
-            _operation=self._operation,
-            _retry_policy=policy,
-            _timeout_policy=self._timeout_policy,
-            _fallback_chain=self._fallback_chain,
-            _circuit_breaker=self._circuit_breaker,
-            _validation_policy=self._validation_policy,
-            _event_emitter=self._event_emitter,
-        )
+        return replace(self, _retry_policy=policy)
 
     def with_timeout(self, policy: TimeoutPolicy) -> AsyncOperation[P, R]:
         """Return a new operation configured with a timeout policy."""
-        return AsyncOperation(
-            name=self.name,
-            _operation=self._operation,
-            _retry_policy=self._retry_policy,
-            _timeout_policy=policy,
-            _fallback_chain=self._fallback_chain,
-            _circuit_breaker=self._circuit_breaker,
-            _validation_policy=self._validation_policy,
-            _event_emitter=self._event_emitter,
-        )
+        return replace(self, _timeout_policy=policy)
 
     def with_fallbacks(self, chain: FallbackChain[P, R]) -> AsyncOperation[P, R]:
         """Return a new operation configured with fallback candidates."""
-        return AsyncOperation(
-            name=self.name,
-            _operation=self._operation,
-            _retry_policy=self._retry_policy,
-            _timeout_policy=self._timeout_policy,
-            _fallback_chain=chain,
-            _circuit_breaker=self._circuit_breaker,
-            _validation_policy=self._validation_policy,
-            _event_emitter=self._event_emitter,
-        )
+        return replace(self, _fallback_chain=chain)
 
     def with_circuit_breaker(self, breaker: CircuitBreaker) -> AsyncOperation[P, R]:
         """Return a new operation configured with a circuit breaker."""
-        return AsyncOperation(
-            name=self.name,
-            _operation=self._operation,
-            _retry_policy=self._retry_policy,
-            _timeout_policy=self._timeout_policy,
-            _fallback_chain=self._fallback_chain,
-            _circuit_breaker=breaker,
-            _validation_policy=self._validation_policy,
-            _event_emitter=self._event_emitter,
-        )
+        return replace(self, _circuit_breaker=breaker)
 
     def with_validation(self, policy: ValidationPolicy[R]) -> AsyncOperation[P, R]:
         """Return a new operation configured with result validation."""
-        return AsyncOperation(
-            name=self.name,
-            _operation=self._operation,
-            _retry_policy=self._retry_policy,
-            _timeout_policy=self._timeout_policy,
-            _fallback_chain=self._fallback_chain,
-            _circuit_breaker=self._circuit_breaker,
-            _validation_policy=policy,
-            _event_emitter=self._event_emitter,
-        )
+        return replace(self, _validation_policy=policy)
 
     def with_events(self, emitter: EventEmitter) -> AsyncOperation[P, R]:
         """Return a new operation configured with a structured event emitter."""
-        return AsyncOperation(
-            name=self.name,
-            _operation=self._operation,
-            _retry_policy=self._retry_policy,
-            _timeout_policy=self._timeout_policy,
-            _fallback_chain=self._fallback_chain,
-            _circuit_breaker=self._circuit_breaker,
-            _validation_policy=self._validation_policy,
-            _event_emitter=emitter,
-        )
+        return replace(self, _event_emitter=emitter)
+
+    def with_idempotency(self, policy: IdempotencyPolicy[P]) -> AsyncOperation[P, R]:
+        """Return a new operation configured with idempotent execution."""
+        return replace(self, _idempotency_policy=policy)
 
     async def run(self, *args: P.args, **kwargs: P.kwargs) -> OperationResult[R]:
+        """Run the operation and return its value with an execution report.
+
+        When idempotency is configured, the entire operation lifecycle is
+        coordinated under one idempotency key. This includes retries, timeouts,
+        validation, circuit breaker checks and fallback execution.
+        """
+        if self._idempotency_policy is None:
+            return await self._run_without_idempotency(*args, **kwargs)
+
+        idempotency_result = await self._idempotency_policy.run(
+            self._run_without_idempotency,
+            *args,
+            **kwargs,
+        )
+
+        return self._operation_result_with_idempotency_metadata(idempotency_result)
+
+    async def _run_without_idempotency(
+        self,
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> OperationResult[R]:
         """Run the operation and return its value with an execution report.
 
         Success returns OperationResult[T].
@@ -665,6 +639,37 @@ class AsyncOperation(Generic[P, R]):
             metadata.update(self._no_validation_metadata())
 
         return metadata
+
+    @staticmethod
+    def _operation_result_with_idempotency_metadata(
+        idempotency_result: IdempotencyResult[OperationResult[R]],
+    ) -> OperationResult[R]:
+        operation_result = idempotency_result.value
+        original_report = operation_result.report
+
+        metadata: MutableMetadata = dict(original_report.metadata)
+        metadata.update(
+            {
+                "idempotency_enabled": True,
+                "idempotency_key": idempotency_result.key,
+                "idempotency_status": idempotency_result.status.value,
+                "idempotency_cache_hit": idempotency_result.cache_hit,
+            }
+        )
+
+        report = ExecutionReport(
+            operation_name=original_report.operation_name,
+            status=original_report.status,
+            started_at=original_report.started_at,
+            duration_seconds=original_report.duration_seconds,
+            attempts=original_report.attempts,
+            metadata=metadata,
+        )
+
+        return OperationResult(
+            value=operation_result.value,
+            report=report,
+        )
 
     def _build_report(
         self,
