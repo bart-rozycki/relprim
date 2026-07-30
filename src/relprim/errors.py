@@ -106,3 +106,18 @@ class IdempotencyReentryError(RelPrimError):
     def __init__(self, key: str) -> None:
         super().__init__(f"Idempotency key '{key}' was reused recursively by its owning task.")
         self.key = key
+
+
+class RetryAfterExtractionError(RelPrimError):
+    """Raised when a retry-after value cannot be extracted safely."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        rate_limit_error: Exception,
+        cause: Exception | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.rate_limit_error = rate_limit_error
+        self.cause = cause
