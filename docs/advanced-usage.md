@@ -2,7 +2,7 @@
 
 RelPrim exposes low-level primitives and a composable async operation builder for advanced reliability workflows.
 
-Use this API when you need explicit composition of retry, timeout, fallback, circuit breaker, validation and structured events.
+Use this API when you need explicit composition of retry, timeout, fallback, circuit breaker, validation, idempotency, rate-limit handling and structured events.
 
 ## Builder API
 
@@ -72,6 +72,79 @@ result = await (
     .run("Write a short product summary")
 )
 ```
+
+## Rate-limit handling
+
+Rate-limit policies recover from provider rejections using retry delays supplied
+by the provider.
+
+Define the provider exception and an extractor that returns the suggested delay
+in seconds:
+
+```python
+class ProviderRateLimitError(Exception):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+def provider_retry_after(
+    exception: Exception,
+) -> float | None:
+    if isinstance(exception, ProviderRateLimitError):
+        return exception.retry_after_seconds
+
+    return None
+```
+
+Create a `RateLimitPolicy` and add it to the operation:
+
+```python
+from relprim import (
+    RateLimitPolicy,
+    RetryPolicy,
+    async_operation,
+)
+
+
+rate_limits = RateLimitPolicy(
+    rate_limit_on=(ProviderRateLimitError,),
+    retry_after=provider_retry_after,
+    max_wait_seconds=30,
+)
+
+result = await (
+    async_operation("generate_response", call_provider)
+    .with_retry(
+        RetryPolicy(
+            max_attempts=4,
+        )
+    )
+    .with_rate_limit(rate_limits)
+    .run("Write a short product summary")
+)
+```
+
+`RetryPolicy` controls the total number of attempts.
+
+`RateLimitPolicy` identifies rate-limit exceptions, extracts the provider delay
+and defines the maximum acceptable wait.
+
+When the provider does not supply a delay, RelPrim uses the retry policy's
+backoff. When the selected delay exceeds `max_wait_seconds`, RelPrim skips the
+retry and continues into fallback or final failure.
+
+The rate-limit exception does not need to appear in `RetryPolicy.retry_on`.
+Configured rate-limit exceptions are handled by `RateLimitPolicy` before the
+normal retry exception filter.
+
+See the [rate-limit handling guide](rate-limits.md) for decorator configuration,
+fallback behavior, metadata, structured events and limitations.
 
 ## Validation
 
@@ -185,7 +258,10 @@ Use the builder API when you want explicit composition.
 result = await (
     async_operation("generate_response", call_provider)
     .with_retry(...)
+    .with_rate_limit(...)
+    .with_idempotency(...)
     .with_timeout(...)
+    .with_validation(...)
     .with_fallbacks(...)
     .with_events(...)
     .run(prompt)
