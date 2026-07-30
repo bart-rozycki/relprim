@@ -9,6 +9,7 @@ from relprim import (
     InMemoryEventSink,
     InMemoryIdempotencyStore,
     OperationExecutionError,
+    RateLimitPolicy,
     RetryPolicy,
     TimeoutPolicy,
     ValidationFailedError,
@@ -619,3 +620,131 @@ def test_resilient_decorator_rejects_non_positive_idempotency_ttl() -> None:
         match="ttl_seconds must be greater than 0",
     ):
         define_operation()
+
+
+class ProviderRateLimitError(Exception):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+def provider_retry_after(
+    exception: Exception,
+) -> float | None:
+    if isinstance(exception, ProviderRateLimitError):
+        return exception.retry_after_seconds
+
+    return None
+
+
+async def test_resilient_decorator_accepts_rate_limit_policy() -> None:
+    calls = 0
+
+    policy = RateLimitPolicy(
+        rate_limit_on=(ProviderRateLimitError,),
+        retry_after=provider_retry_after,
+        max_wait_seconds=10,
+    )
+
+    @resilient(
+        retry=RetryPolicy(
+            max_attempts=2,
+            async_sleeper=no_sleep,
+        ),
+        rate_limit=policy,
+    )
+    async def provider() -> str:
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            raise ProviderRateLimitError(
+                "too many requests",
+                retry_after_seconds=0,
+            )
+
+        return "ok"
+
+    result = await provider()
+
+    assert result.value == "ok"
+    assert calls == 2
+
+
+def test_resilient_decorator_rejects_conflicting_rate_limit_configuration() -> None:
+    policy = RateLimitPolicy(
+        rate_limit_on=(ProviderRateLimitError,),
+    )
+
+    def define_operation() -> None:
+        @resilient(
+            rate_limit=policy,
+            rate_limit_on=(ProviderRateLimitError,),
+        )
+        async def provider() -> str:
+            return "ok"
+
+    with pytest.raises(
+        ValueError,
+        match="rate_limit cannot be combined",
+    ):
+        define_operation()
+
+
+def test_resilient_decorator_rejects_retry_after_without_rate_limit_on() -> None:
+    def retry_after(exception: Exception) -> float | None:
+        return 1
+
+    def define_operation() -> None:
+        @resilient(retry_after=retry_after)
+        async def provider() -> str:
+            return "ok"
+
+    with pytest.raises(
+        ValueError,
+        match="require rate_limit_on",
+    ):
+        define_operation()
+
+
+async def test_resilient_decorator_accepts_simple_rate_limit_options() -> None:
+    calls = 0
+    delays: list[float] = []
+
+    async def capture_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    @resilient(
+        retry=RetryPolicy(
+            max_attempts=2,
+            async_sleeper=capture_sleep,
+        ),
+        rate_limit_on=(ProviderRateLimitError,),
+        retry_after=provider_retry_after,
+        max_rate_limit_wait=10,
+    )
+    async def provider() -> str:
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            raise ProviderRateLimitError(
+                "too many requests",
+                retry_after_seconds=2,
+            )
+
+        return "ok"
+
+    result = await provider()
+
+    assert result.value == "ok"
+    assert calls == 2
+    assert delays == [2]
+    assert result.report.metadata["rate_limit_encountered"] is True
+    assert result.report.metadata["rate_limit_wait_seconds"] == 2
+    assert result.report.metadata["rate_limit_wait_exceeded"] is False

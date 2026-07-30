@@ -13,6 +13,11 @@ from relprim.idempotency import (
     idempotency_policy,
 )
 from relprim.operation import async_operation
+from relprim.rate_limit import (
+    RateLimitPolicy,
+    RetryAfterExtractor,
+    rate_limit_policy,
+)
 from relprim.result import OperationResult
 from relprim.retry import RetryPolicy
 from relprim.timeout import TimeoutPolicy
@@ -137,6 +142,40 @@ def _idempotency_policy_from(
     )
 
 
+def _rate_limit_policy_from(
+    *,
+    rate_limit: RateLimitPolicy | None,
+    rate_limit_on: tuple[type[Exception], ...] | None,
+    retry_after: RetryAfterExtractor | None,
+    max_rate_limit_wait: float | None,
+) -> RateLimitPolicy | None:
+    simple_configuration_used = (
+        rate_limit_on is not None or retry_after is not None or max_rate_limit_wait is not None
+    )
+
+    if rate_limit is not None and simple_configuration_used:
+        raise ValueError(
+            "rate_limit cannot be combined with rate_limit_on, retry_after or max_rate_limit_wait."
+        )
+
+    if rate_limit is not None:
+        return rate_limit
+
+    if rate_limit_on is None:
+        if retry_after is not None or max_rate_limit_wait is not None:
+            raise ValueError("retry_after and max_rate_limit_wait require rate_limit_on.")
+
+        return None
+
+    max_wait_seconds = 60.0 if max_rate_limit_wait is None else max_rate_limit_wait
+
+    return rate_limit_policy(
+        rate_limit_on=rate_limit_on,
+        retry_after=retry_after,
+        max_wait_seconds=max_wait_seconds,
+    )
+
+
 def resilient(
     *,
     name: str | None = None,
@@ -153,12 +192,17 @@ def resilient(
     idempotency_key: Callable[P, str] | None = None,
     idempotency_store: IdempotencyStore | None = None,
     idempotency_ttl: float | None = None,
+    rate_limit: RateLimitPolicy | None = None,
+    rate_limit_on: tuple[type[Exception], ...] | None = None,
+    retry_after: RetryAfterExtractor | None = None,
+    max_rate_limit_wait: float | None = None,
 ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[OperationResult[R]]]]:
     """Wrap an async callable in a resilient RelPrim operation.
 
     The decorated function returns OperationResult[T], not a raw value. This keeps
-    execution metadata explicit and makes retries, fallbacks, validation,
-    idempotency and structured events observable.
+    execution metadata explicit and makes retries, timeouts, fallbacks, validation,
+    circuit breaker behavior, idempotency, rate-limit recovery and structured
+    events observable.
 
     Simple usage:
         @resilient(
@@ -166,6 +210,9 @@ def resilient(
             timeout=10,
             fallback=call_backup_provider,
             idempotency_key=lambda request_id, payload: request_id,
+            rate_limit_on=(ProviderRateLimitError,),
+            retry_after=provider_retry_after,
+            max_rate_limit_wait=30,
         )
         async def create_payment(
             request_id: str,
@@ -185,6 +232,11 @@ def resilient(
                 lambda request_id, payload: request_id,
                 store=shared_store,
                 ttl_seconds=3600,
+            ),
+            rate_limit=RateLimitPolicy(
+                rate_limit_on=(ProviderRateLimitError,),
+                retry_after=provider_retry_after,
+                max_wait_seconds=30,
             ),
         )
         async def create_payment(
@@ -211,6 +263,12 @@ def resilient(
         idempotency_key=idempotency_key,
         idempotency_store=idempotency_store,
         idempotency_ttl=idempotency_ttl,
+    )
+    resolved_rate_limit_policy = _rate_limit_policy_from(
+        rate_limit=rate_limit,
+        rate_limit_on=rate_limit_on,
+        retry_after=retry_after,
+        max_rate_limit_wait=max_rate_limit_wait,
     )
 
     def decorator(
@@ -242,6 +300,9 @@ def resilient(
             configured_operation = configured_operation.with_idempotency(
                 resolved_idempotency_policy
             )
+
+        if resolved_rate_limit_policy is not None:
+            configured_operation = configured_operation.with_rate_limit(resolved_rate_limit_policy)
 
         @wraps(operation)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> OperationResult[R]:
