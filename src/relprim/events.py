@@ -16,21 +16,24 @@ TimestampFactory: TypeAlias = Callable[[], datetime]
 class EventType(StrEnum):
     """Structured event type emitted by RelPrim components."""
 
-    OPERATION_STARTED = "operation.started"
-    OPERATION_SUCCEEDED = "operation.succeeded"
-    OPERATION_FAILED = "operation.failed"
-
     ATTEMPT_STARTED = "attempt.started"
     ATTEMPT_SUCCEEDED = "attempt.succeeded"
     ATTEMPT_FAILED = "attempt.failed"
 
-    RETRY_SCHEDULED = "retry.scheduled"
+    CIRCUIT_BREAKER_REJECTED = "circuit_breaker.rejected"
 
     FALLBACK_STARTED = "fallback.started"
     FALLBACK_SUCCEEDED = "fallback.succeeded"
     FALLBACK_FAILED = "fallback.failed"
 
-    CIRCUIT_BREAKER_REJECTED = "circuit_breaker.rejected"
+    OPERATION_STARTED = "operation.started"
+    OPERATION_SUCCEEDED = "operation.succeeded"
+    OPERATION_FAILED = "operation.failed"
+
+    RATE_LIMIT_DETECTED = "rate_limit.detected"
+    RATE_LIMIT_WAIT_EXCEEDED = "rate_limit.wait_exceeded"
+
+    RETRY_SCHEDULED = "retry.scheduled"
 
     VALIDATION_SUCCEEDED = "validation.succeeded"
     VALIDATION_FAILED = "validation.failed"

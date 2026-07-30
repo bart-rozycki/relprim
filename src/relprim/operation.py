@@ -4,6 +4,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Generic, ParamSpec, TypeAlias, TypeVar
 
 from relprim.circuit_breaker import CircuitBreaker
@@ -12,11 +13,13 @@ from relprim.errors import (
     FallbackChainError,
     OperationExecutionError,
     OperationTimeoutError,
+    RetryAfterExtractionError,
     ValidationFailedError,
 )
 from relprim.events import EventEmitter, EventType
 from relprim.fallback import FallbackChain, FallbackResult
 from relprim.idempotency import IdempotencyPolicy, IdempotencyResult
+from relprim.rate_limit import RateLimitDecision, RateLimitPolicy
 from relprim.report import (
     AttemptStatus,
     ExecutionAttempt,
@@ -35,6 +38,31 @@ R = TypeVar("R")
 MetadataValue: TypeAlias = str | int | float | bool | None
 Metadata: TypeAlias = Mapping[str, MetadataValue]
 MutableMetadata: TypeAlias = dict[str, MetadataValue]
+
+
+class _RetryDelaySource(StrEnum):
+    BACKOFF = "backoff"
+    PROVIDER = "provider"
+
+
+@dataclass(frozen=True, slots=True)
+class _RetryPlan:
+    retryable: bool
+    rate_limited: bool = False
+    retry_after_seconds: float | None = None
+    delay_seconds: float | None = None
+    delay_source: _RetryDelaySource | None = None
+    max_wait_exceeded: bool = False
+
+    def __post_init__(self) -> None:
+        if self.retryable:
+            if self.delay_seconds is None or self.delay_source is None:
+                raise ValueError("retryable plans must include delay information.")
+        elif self.delay_seconds is not None or self.delay_source is not None:
+            raise ValueError("non-retryable plans must not include a retry delay.")
+
+        if self.max_wait_exceeded and not self.rate_limited:
+            raise ValueError("max_wait_exceeded requires a rate-limited plan.")
 
 
 def _utc_now() -> datetime:
@@ -67,6 +95,7 @@ class AsyncOperation(Generic[P, R]):
     _validation_policy: ValidationPolicy[R] | None = None
     _event_emitter: EventEmitter | None = None
     _idempotency_policy: IdempotencyPolicy[P] | None = None
+    _rate_limit_policy: RateLimitPolicy | None = None
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -99,6 +128,10 @@ class AsyncOperation(Generic[P, R]):
     def with_idempotency(self, policy: IdempotencyPolicy[P]) -> AsyncOperation[P, R]:
         """Return a new operation configured with idempotent execution."""
         return replace(self, _idempotency_policy=policy)
+
+    def with_rate_limit(self, policy: RateLimitPolicy) -> AsyncOperation[P, R]:
+        """Return a new operation configured with rate-limit handling."""
+        return replace(self, _rate_limit_policy=policy)
 
     async def run(self, *args: P.args, **kwargs: P.kwargs) -> OperationResult[R]:
         """Run the operation and return its value with an execution report.
@@ -134,6 +167,9 @@ class AsyncOperation(Generic[P, R]):
         operation_started_at = _utc_now()
         operation_started_monotonic = time.perf_counter()
         attempts: list[ExecutionAttempt] = []
+        rate_limit_encountered = False
+        rate_limit_wait_seconds = 0.0
+        rate_limit_wait_exceeded = False
 
         await self._emit_event(
             EventType.OPERATION_STARTED,
@@ -143,6 +179,7 @@ class AsyncOperation(Generic[P, R]):
                 "fallback_enabled": self._fallback_chain is not None,
                 "circuit_breaker_enabled": self._circuit_breaker is not None,
                 "validation_enabled": self._validation_policy is not None,
+                "rate_limit_enabled": self._rate_limit_policy is not None,
             },
         )
 
@@ -163,10 +200,59 @@ class AsyncOperation(Generic[P, R]):
             try:
                 value, validation_metadata = await self._run_single_attempt(*args, **kwargs)
             except Exception as exc:
+                try:
+                    retry_plan = self._retry_plan_for_exception(
+                        exc,
+                        attempt_number=attempt_number,
+                    )
+                except RetryAfterExtractionError as extraction_error:
+                    exc = extraction_error
+                    retry_plan = _RetryPlan(retryable=False)
+
                 attempt_status = self._attempt_status_for_exception(exc)
-                retryable = self._is_retryable(exc)
+                retryable = retry_plan.retryable
+
+                if retry_plan.rate_limited:
+                    rate_limit_encountered = True
+                    rate_limit_wait_exceeded = (
+                        rate_limit_wait_exceeded or retry_plan.max_wait_exceeded
+                    )
+
+                    await self._emit_event(
+                        EventType.RATE_LIMIT_DETECTED,
+                        payload={
+                            "attempt_number": attempt_number,
+                            "error_type": exc.__class__.__name__,
+                            "retry_after_seconds": retry_plan.retry_after_seconds,
+                            "max_wait_seconds": (
+                                self._rate_limit_policy.max_wait_seconds
+                                if self._rate_limit_policy is not None
+                                else None
+                            ),
+                            "max_wait_exceeded": retry_plan.max_wait_exceeded,
+                        },
+                    )
+
+                    if retry_plan.max_wait_exceeded:
+                        await self._emit_event(
+                            EventType.RATE_LIMIT_WAIT_EXCEEDED,
+                            payload={
+                                "attempt_number": attempt_number,
+                                "retry_after_seconds": retry_plan.retry_after_seconds,
+                                "delay_seconds": retry_plan.delay_seconds,
+                                "max_wait_seconds": (
+                                    self._rate_limit_policy.max_wait_seconds
+                                    if self._rate_limit_policy is not None
+                                    else None
+                                ),
+                            },
+                        )
+
                 attempt_duration = _elapsed_seconds(attempt_started_monotonic)
-                failure_metadata = self._primary_failure_metadata(exc)
+                failure_metadata = self._primary_failure_metadata(
+                    exc,
+                    retry_plan=retry_plan,
+                )
 
                 if isinstance(exc, ValidationFailedError):
                     await self._emit_event(
@@ -214,7 +300,14 @@ class AsyncOperation(Generic[P, R]):
                 final_primary_failure = (not retryable) or attempt_number >= max_attempts
 
                 if not final_primary_failure:
-                    await self._sleep_before_retry(attempt_number)
+                    delay_seconds = await self._sleep_before_retry(
+                        attempt_number,
+                        retry_plan=retry_plan,
+                    )
+
+                    if retry_plan.rate_limited:
+                        rate_limit_wait_seconds += delay_seconds
+
                     continue
 
                 if self._fallback_chain is not None:
@@ -283,12 +376,23 @@ class AsyncOperation(Generic[P, R]):
                             },
                         )
 
+                        rate_limit_summary_metadata = self._rate_limit_summary_metadata(
+                            encountered=rate_limit_encountered,
+                            wait_seconds=rate_limit_wait_seconds,
+                            wait_exceeded=rate_limit_wait_exceeded,
+                        )
+
+                        report_metadata = self._merge_metadata(
+                            fallback_metadata,
+                            rate_limit_summary_metadata,
+                        )
+
                         report = self._build_report(
                             status=self._report_status_for_attempt_status(attempts[-1].status),
                             started_at=operation_started_at,
                             started_monotonic=operation_started_monotonic,
                             attempts=attempts,
-                            metadata=fallback_metadata,
+                            metadata=report_metadata,
                         )
 
                         await self._emit_event(
@@ -298,7 +402,7 @@ class AsyncOperation(Generic[P, R]):
                                 "attempt_count": report.attempt_count,
                                 "retry_count": report.retry_count,
                                 "error_type": fallback_exc.__class__.__name__,
-                                **fallback_metadata,
+                                **report_metadata,
                             },
                         )
 
@@ -354,12 +458,23 @@ class AsyncOperation(Generic[P, R]):
                         },
                     )
 
+                    rate_limit_summary_metadata = self._rate_limit_summary_metadata(
+                        encountered=rate_limit_encountered,
+                        wait_seconds=rate_limit_wait_seconds,
+                        wait_exceeded=rate_limit_wait_exceeded,
+                    )
+
+                    report_metadata = self._merge_metadata(
+                        fallback_metadata,
+                        rate_limit_summary_metadata,
+                    )
+
                     report = self._build_report(
                         status=ExecutionStatus.SUCCEEDED,
                         started_at=operation_started_at,
                         started_monotonic=operation_started_monotonic,
                         attempts=attempts,
-                        metadata=fallback_metadata,
+                        metadata=report_metadata,
                     )
 
                     await self._emit_event(
@@ -368,18 +483,32 @@ class AsyncOperation(Generic[P, R]):
                             "duration_seconds": report.duration_seconds,
                             "attempt_count": report.attempt_count,
                             "retry_count": report.retry_count,
-                            **fallback_metadata,
+                            **report_metadata,
                         },
                     )
 
-                    return OperationResult(value=fallback_result.value, report=report)
+                    return OperationResult(
+                        value=fallback_result.value,
+                        report=report,
+                    )
+
+                rate_limit_summary_metadata = self._rate_limit_summary_metadata(
+                    encountered=rate_limit_encountered,
+                    wait_seconds=rate_limit_wait_seconds,
+                    wait_exceeded=rate_limit_wait_exceeded,
+                )
+
+                report_metadata = self._merge_metadata(
+                    failure_metadata,
+                    rate_limit_summary_metadata,
+                )
 
                 report = self._build_report(
                     status=self._report_status_for_attempt_status(attempt_status),
                     started_at=operation_started_at,
                     started_monotonic=operation_started_monotonic,
                     attempts=attempts,
-                    metadata=failure_metadata,
+                    metadata=report_metadata,
                 )
 
                 await self._emit_event(
@@ -389,7 +518,7 @@ class AsyncOperation(Generic[P, R]):
                         "attempt_count": report.attempt_count,
                         "retry_count": report.retry_count,
                         "error_type": exc.__class__.__name__,
-                        **failure_metadata,
+                        **report_metadata,
                     },
                 )
 
@@ -430,12 +559,23 @@ class AsyncOperation(Generic[P, R]):
                 },
             )
 
+            rate_limit_summary_metadata = self._rate_limit_summary_metadata(
+                encountered=rate_limit_encountered,
+                wait_seconds=rate_limit_wait_seconds,
+                wait_exceeded=rate_limit_wait_exceeded,
+            )
+
+            report_metadata = self._merge_metadata(
+                success_metadata,
+                rate_limit_summary_metadata,
+            )
+
             report = self._build_report(
                 status=ExecutionStatus.SUCCEEDED,
                 started_at=operation_started_at,
                 started_monotonic=operation_started_monotonic,
                 attempts=attempts,
-                metadata=success_metadata,
+                metadata=report_metadata,
             )
 
             await self._emit_event(
@@ -444,7 +584,7 @@ class AsyncOperation(Generic[P, R]):
                     "duration_seconds": report.duration_seconds,
                     "attempt_count": report.attempt_count,
                     "retry_count": report.retry_count,
-                    **success_metadata,
+                    **report_metadata,
                 },
             )
 
@@ -497,28 +637,35 @@ class AsyncOperation(Generic[P, R]):
             reason=reason,
         )
 
-    async def _sleep_before_retry(self, attempt_number: int) -> None:
+    async def _sleep_before_retry(
+        self,
+        attempt_number: int,
+        *,
+        retry_plan: _RetryPlan,
+    ) -> float:
         if self._retry_policy is None:
             raise RuntimeError("Retry sleep requested without retry policy.")
 
-        delay = self._retry_policy.backoff.delay_for_retry(attempt_number)
+        if not retry_plan.retryable or retry_plan.delay_seconds is None:
+            raise RuntimeError("Retry sleep requested without a retryable plan.")
 
         await self._emit_event(
             EventType.RETRY_SCHEDULED,
             payload={
                 "attempt_number": attempt_number,
                 "next_attempt_number": attempt_number + 1,
-                "delay_seconds": delay,
+                "delay_seconds": retry_plan.delay_seconds,
+                "delay_source": (
+                    retry_plan.delay_source.value if retry_plan.delay_source is not None else None
+                ),
+                "rate_limited": retry_plan.rate_limited,
+                "retry_after_seconds": retry_plan.retry_after_seconds,
             },
         )
 
-        await self._retry_policy.async_sleeper(delay)
+        await self._retry_policy.async_sleeper(retry_plan.delay_seconds)
 
-    def _is_retryable(self, exception: Exception) -> bool:
-        if self._retry_policy is None:
-            return False
-
-        return isinstance(exception, self._retry_policy.retry_on)
+        return retry_plan.delay_seconds
 
     async def _emit_event(
         self,
@@ -595,13 +742,33 @@ class AsyncOperation(Generic[P, R]):
     def _primary_success_metadata(self, validation_metadata: Metadata) -> MutableMetadata:
         return self._base_metadata(validation_metadata)
 
-    def _primary_failure_metadata(self, exception: Exception) -> MutableMetadata:
+    def _primary_failure_metadata(
+        self,
+        exception: Exception,
+        *,
+        retry_plan: _RetryPlan,
+    ) -> MutableMetadata:
         metadata = self._base_metadata()
 
-        metadata["circuit_breaker_open"] = isinstance(exception, CircuitBreakerOpenError)
+        metadata["circuit_breaker_open"] = isinstance(
+            exception,
+            CircuitBreakerOpenError,
+        )
 
         if isinstance(exception, ValidationFailedError):
             metadata.update(self._validation_failure_metadata(exception))
+
+        metadata.update(
+            {
+                "rate_limited": retry_plan.rate_limited,
+                "rate_limit_retry_after_seconds": (retry_plan.retry_after_seconds),
+                "rate_limit_delay_seconds": retry_plan.delay_seconds,
+                "rate_limit_delay_source": (
+                    retry_plan.delay_source.value if retry_plan.delay_source is not None else None
+                ),
+                "rate_limit_wait_exceeded": (retry_plan.max_wait_exceeded),
+            }
+        )
 
         return metadata
 
@@ -670,6 +837,106 @@ class AsyncOperation(Generic[P, R]):
             value=operation_result.value,
             report=report,
         )
+
+    def _retry_plan_for_exception(
+        self,
+        exception: Exception,
+        *,
+        attempt_number: int,
+    ) -> _RetryPlan:
+        rate_limit_decision = self._rate_limit_decision(exception)
+
+        if rate_limit_decision.rate_limited:
+            return self._rate_limit_retry_plan(
+                rate_limit_decision,
+                attempt_number=attempt_number,
+            )
+
+        if self._retry_policy is None:
+            return _RetryPlan(retryable=False)
+
+        if not isinstance(exception, self._retry_policy.retry_on):
+            return _RetryPlan(retryable=False)
+
+        delay_seconds = self._retry_policy.backoff.delay_for_retry(attempt_number)
+
+        return _RetryPlan(
+            retryable=True,
+            delay_seconds=delay_seconds,
+            delay_source=_RetryDelaySource.BACKOFF,
+        )
+
+    def _rate_limit_decision(
+        self,
+        exception: Exception,
+    ) -> RateLimitDecision:
+        if self._rate_limit_policy is None:
+            return RateLimitDecision.not_rate_limited()
+
+        return self._rate_limit_policy.evaluate(exception)
+
+    def _rate_limit_retry_plan(
+        self,
+        decision: RateLimitDecision,
+        *,
+        attempt_number: int,
+    ) -> _RetryPlan:
+        if self._rate_limit_policy is None:
+            raise RuntimeError("Rate-limit decision created without a rate-limit policy.")
+
+        if self._retry_policy is None:
+            return _RetryPlan(
+                retryable=False,
+                rate_limited=True,
+                retry_after_seconds=decision.retry_after_seconds,
+            )
+
+        if decision.retry_after_seconds is not None:
+            delay_seconds = decision.retry_after_seconds
+            delay_source = _RetryDelaySource.PROVIDER
+        else:
+            delay_seconds = self._retry_policy.backoff.delay_for_retry(attempt_number)
+            delay_source = _RetryDelaySource.BACKOFF
+
+        if delay_seconds > self._rate_limit_policy.max_wait_seconds:
+            return _RetryPlan(
+                retryable=False,
+                rate_limited=True,
+                retry_after_seconds=decision.retry_after_seconds,
+                max_wait_exceeded=True,
+            )
+
+        return _RetryPlan(
+            retryable=True,
+            rate_limited=True,
+            retry_after_seconds=decision.retry_after_seconds,
+            delay_seconds=delay_seconds,
+            delay_source=delay_source,
+        )
+
+    @staticmethod
+    def _rate_limit_summary_metadata(
+        *,
+        encountered: bool,
+        wait_seconds: float,
+        wait_exceeded: bool,
+    ) -> MutableMetadata:
+        return {
+            "rate_limit_encountered": encountered,
+            "rate_limit_wait_seconds": wait_seconds,
+            "rate_limit_wait_exceeded": wait_exceeded,
+        }
+
+    @staticmethod
+    def _merge_metadata(
+        *items: Mapping[str, MetadataValue],
+    ) -> MutableMetadata:
+        metadata: MutableMetadata = {}
+
+        for item in items:
+            metadata.update(item)
+
+        return metadata
 
     def _build_report(
         self,
