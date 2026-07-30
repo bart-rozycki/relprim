@@ -26,6 +26,8 @@ keywords = [
     "ai-workflows",
     "idempotency",
     "deduplication",
+    "rate-limiting",
+    "retry-after",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

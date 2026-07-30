@@ -7,7 +7,7 @@
 
 Reliability primitives for operations that cross process, network or provider boundaries.
 
-RelPrim helps you wrap external calls with retries, timeouts, fallbacks, validation, circuit breakers, execution reports and structured events.
+RelPrim helps you wrap external calls with retries, timeouts, fallbacks, validation, circuit breakers, idempotency, provider-aware rate-limit recovery, execution reports and structured events.
 
 ## Install
 
@@ -78,6 +78,41 @@ result = await (
 )
 ```
 
+## What RelPrim provides
+
+Current primitives:
+
+* Resilient decorator API
+* Retry policies
+* Exponential backoff with jitter
+* Provider-aware rate-limit recovery
+* Provider retry-after delay handling
+* Async timeout enforcement
+* Async fallback chains
+* Async circuit breakers
+* Validation policies
+* Callable validators
+* Structured events
+* Event emitters
+* No-op event sink
+* In-memory event sink
+* Async operation builder API
+* Structured execution reports
+* Operation results
+* Typed execution errors
+* Idempotency policies
+* Concurrent execution joining
+* Successful result replay
+* In-memory idempotency store
+
+Planned primitives:
+
+* SQLite event store
+* OpenTelemetry exporter
+* JSON Schema validator adapter
+* Pydantic validator adapter
+
+
 ## Prevent duplicate executions
 
 RelPrim can deduplicate repeated or concurrent calls using an idempotency key.
@@ -103,39 +138,45 @@ The first call executes the operation. Concurrent callers join the same executio
 
 The default store is in-memory and single-process. See the [idempotency guide](docs/idempotency.md) for concurrency semantics, key design and store limitations.
 
+## Respect provider rate limits
 
-## What RelPrim provides
+RelPrim can use retry delays supplied by an external provider and avoid waiting
+longer than the current operation allows.
 
-Current primitives:
+Provider SDKs expose retry information differently, so a small extractor
+translates the provider exception into a delay expressed in seconds:
 
-* Resilient decorator API
-* Retry policies
-* Exponential backoff with jitter
-* Async timeout enforcement
-* Async fallback chains
-* Async circuit breakers
-* Validation policies
-* Callable validators
-* Structured events
-* Event emitters
-* No-op event sink
-* In-memory event sink
-* Async operation builder API
-* Structured execution reports
-* Operation results
-* Typed execution errors
-* Idempotency policies
-* Concurrent execution joining
-* Successful result replay
-* In-memory idempotency store
+```python
+def provider_retry_after(
+    exception: Exception,
+) -> float | None:
+    if isinstance(exception, ProviderRateLimitError):
+        return exception.retry_after_seconds
 
-Planned primitives:
+    return None
+```
 
-* SQLite event store
-* OpenTelemetry exporter
-* Rate limit handling
-* JSON Schema validator adapter
-* Pydantic validator adapter
+Pass the extractor to `@resilient(...)`:
+
+```python
+@resilient(
+    retries=3,
+    timeout=10,
+    rate_limit_on=(ProviderRateLimitError,),
+    retry_after=provider_retry_after,
+    max_rate_limit_wait=30,
+    fallback=call_backup_provider,
+)
+async def call_provider(prompt: str) -> str:
+    return await provider.generate(prompt)
+```
+
+RelPrim uses the provider delay when available and falls back to the normal
+retry backoff otherwise. When the selected delay exceeds
+`max_rate_limit_wait`, the operation continues into fallback or final failure.
+
+See the [rate-limit handling guide](docs/rate-limits.md) for delay selection,
+report metadata, structured events and limitations.
 
 ## Examples
 
@@ -148,6 +189,7 @@ Practical examples are available in the [`examples`](examples) directory:
 * [`validation.py`](examples/validation.py) — result validation with retry support
 * [`structured_events.py`](examples/structured_events.py) — operation lifecycle events with retry and validation
 * [`idempotency.py`](examples/idempotency.py) — duplicate execution prevention and result replay
+* [`rate_limit.py`](examples/rate_limit.py) — provider retry-after handling and maximum wait enforcement
 
 If you run examples from a cloned repository, install RelPrim in editable mode first:
 
@@ -167,6 +209,7 @@ PYTHONPATH=src python examples/decorator_usage.py
 * [Getting started](docs/getting-started.md)
 * [Advanced usage](docs/advanced-usage.md)
 * [Idempotency](docs/idempotency.md)
+* [Rate-limit handling](docs/rate-limits.md)
 
 ## Design principles
 

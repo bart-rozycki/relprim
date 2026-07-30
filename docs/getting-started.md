@@ -86,6 +86,65 @@ The default store is in-memory and coordinates calls only within one Python proc
 
 See the [idempotency guide](idempotency.md) before using idempotency for multi-process or distributed systems.
 
+## Recover from provider rate limits
+
+Some providers reject requests temporarily and include information about when
+the caller should try again.
+
+Provider SDKs expose this information differently. Create a small extractor that
+translates the provider exception into a delay expressed in seconds:
+
+```python
+class ProviderRateLimitError(Exception):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+def provider_retry_after(
+    exception: Exception,
+) -> float | None:
+    if isinstance(exception, ProviderRateLimitError):
+        return exception.retry_after_seconds
+
+    return None
+```
+
+Configure the exception type and extractor on the decorator:
+
+```python
+from relprim import resilient
+
+
+@resilient(
+    retries=3,
+    timeout=10,
+    rate_limit_on=(ProviderRateLimitError,),
+    retry_after=provider_retry_after,
+    max_rate_limit_wait=30,
+)
+async def call_provider(prompt: str) -> str:
+    return await provider.generate(prompt)
+```
+
+When the provider supplies a delay, RelPrim uses it for the next attempt.
+
+When the extractor returns `None`, RelPrim uses the normal retry backoff.
+
+When the selected delay exceeds `max_rate_limit_wait`, RelPrim does not retry
+the primary operation and continues into fallback or final failure.
+
+Rate-limit handling requires retries to be configured. It identifies the failure
+and selects the delay, but it does not create additional attempts by itself.
+
+See the [rate-limit handling guide](rate-limits.md) for advanced policies,
+fallback behavior, report metadata and structured events.
+
 ## Validate provider responses
 
 External providers may return malformed, empty or unusable responses.
