@@ -11,6 +11,7 @@ from relprim.errors import (
     OperationExecutionError,
     OperationTimeoutError,
     RelPrimError,
+    RetryAfterExtractionError,
     RetryError,
     ValidationFailedError,
 )
@@ -38,6 +39,12 @@ from relprim.idempotency import (
     idempotency_policy,
 )
 from relprim.operation import AsyncOperation, async_operation
+from relprim.rate_limit import (
+    RateLimitDecision,
+    RateLimitPolicy,
+    RetryAfterExtractor,
+    rate_limit_policy,
+)
 from relprim.report import (
     AttemptStatus,
     ExecutionAttempt,
@@ -89,7 +96,11 @@ __all__ = [
     "OperationExecutionError",
     "OperationResult",
     "OperationTimeoutError",
+    "RateLimitDecision",
+    "RateLimitPolicy",
     "RelPrimError",
+    "RetryAfterExtractionError",
+    "RetryAfterExtractor",
     "RetryAttempt",
     "RetryError",
     "RetryPolicy",
@@ -104,5 +115,6 @@ __all__ = [
     "async_operation",
     "fallback_chain",
     "idempotency_policy",
+    "rate_limit_policy",
     "resilient",
 ]
