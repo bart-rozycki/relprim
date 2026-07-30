@@ -16,6 +16,7 @@ from relprim import (
     InMemoryEventSink,
     InMemoryIdempotencyStore,
     OperationExecutionError,
+    RateLimitPolicy,
     RetryPolicy,
     TimeoutPolicy,
     ValidationFailedError,
@@ -33,6 +34,26 @@ class TransientError(Exception):
 
 class PermanentError(Exception):
     pass
+
+
+class ProviderRateLimitError(Exception):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+def provider_retry_after(
+    exception: Exception,
+) -> float | None:
+    if isinstance(exception, ProviderRateLimitError):
+        return exception.retry_after_seconds
+
+    return None
 
 
 async def async_no_sleep(_: float) -> None:
@@ -1224,3 +1245,240 @@ async def test_async_operation_builder_preserves_event_emitter_across_policy_cha
         assert second.value == "response:request-123"
         assert calls == 1
         assert second.report.metadata["idempotency_status"] == "replayed"
+
+
+async def test_async_operation_uses_provider_retry_after_delay() -> None:
+    delays: list[float] = []
+    calls = 0
+
+    async def capture_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            raise ProviderRateLimitError(
+                "too many requests",
+                retry_after_seconds=2.5,
+            )
+
+        return "ok"
+
+    result = await (
+        async_operation("provider_call", operation)
+        .with_retry(
+            RetryPolicy(
+                max_attempts=2,
+                retry_on=(TransientError,),
+                async_sleeper=capture_sleep,
+            )
+        )
+        .with_rate_limit(
+            RateLimitPolicy(
+                rate_limit_on=(ProviderRateLimitError,),
+                retry_after=provider_retry_after,
+                max_wait_seconds=10,
+            )
+        )
+        .run()
+    )
+
+    assert result.value == "ok"
+    assert calls == 2
+    assert delays == [2.5]
+    assert result.report.attempts[0].metadata["rate_limited"] is True
+    assert result.report.attempts[0].metadata["rate_limit_delay_source"] == "provider"
+    assert result.report.metadata["rate_limit_encountered"] is True
+    assert result.report.metadata["rate_limit_wait_seconds"] == 2.5
+
+
+async def test_async_operation_uses_backoff_when_retry_after_is_missing() -> None:
+    delays: list[float] = []
+    calls = 0
+
+    async def capture_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            raise ProviderRateLimitError("too many requests")
+
+        return "ok"
+
+    result = await (
+        async_operation("provider_call", operation)
+        .with_retry(
+            RetryPolicy(
+                max_attempts=2,
+                retry_on=(TransientError,),
+                backoff=ExponentialBackoff(
+                    base_delay_seconds=0.25,
+                    max_delay_seconds=1,
+                    jitter=False,
+                ),
+                async_sleeper=capture_sleep,
+            )
+        )
+        .with_rate_limit(
+            RateLimitPolicy(
+                rate_limit_on=(ProviderRateLimitError,),
+                retry_after=provider_retry_after,
+                max_wait_seconds=10,
+            )
+        )
+        .run()
+    )
+
+    assert result.value == "ok"
+    assert delays == [0.25]
+    assert result.report.attempts[0].metadata["rate_limit_delay_source"] == "backoff"
+
+
+async def test_async_operation_uses_fallback_when_rate_limit_wait_is_too_long() -> None:
+    delays: list[float] = []
+
+    async def capture_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async def primary() -> str:
+        raise ProviderRateLimitError(
+            "too many requests",
+            retry_after_seconds=120,
+        )
+
+    async def fallback() -> str:
+        return "fallback response"
+
+    result = await (
+        async_operation("provider_call", primary)
+        .with_retry(
+            RetryPolicy(
+                max_attempts=3,
+                async_sleeper=capture_sleep,
+            )
+        )
+        .with_rate_limit(
+            RateLimitPolicy(
+                rate_limit_on=(ProviderRateLimitError,),
+                retry_after=provider_retry_after,
+                max_wait_seconds=10,
+            )
+        )
+        .with_fallbacks(fallback_chain(("backup_provider", fallback)))
+        .run()
+    )
+
+    assert result.value == "fallback response"
+    assert delays == []
+    assert result.report.metadata["fallback_used"] is True
+    assert result.report.metadata["rate_limit_encountered"] is True
+    assert result.report.metadata["rate_limit_wait_exceeded"] is True
+    assert result.report.attempts[0].metadata["rate_limit_wait_exceeded"] is True
+
+
+async def test_async_operation_emits_rate_limit_events() -> None:
+    sink = InMemoryEventSink()
+    emitter = EventEmitter(sinks=(sink,))
+    calls = 0
+
+    async def no_sleep(delay: float) -> None:
+        return None
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            raise ProviderRateLimitError(
+                "too many requests",
+                retry_after_seconds=1,
+            )
+
+        return "ok"
+
+    await (
+        async_operation("provider_call", operation)
+        .with_events(emitter)
+        .with_retry(
+            RetryPolicy(
+                max_attempts=2,
+                async_sleeper=no_sleep,
+            )
+        )
+        .with_rate_limit(
+            RateLimitPolicy(
+                rate_limit_on=(ProviderRateLimitError,),
+                retry_after=provider_retry_after,
+                max_wait_seconds=10,
+            )
+        )
+        .run()
+    )
+
+    event_types = [event.event_type for event in await sink.events()]
+
+    assert event_types == [
+        EventType.OPERATION_STARTED,
+        EventType.ATTEMPT_STARTED,
+        EventType.RATE_LIMIT_DETECTED,
+        EventType.ATTEMPT_FAILED,
+        EventType.RETRY_SCHEDULED,
+        EventType.ATTEMPT_STARTED,
+        EventType.ATTEMPT_SUCCEEDED,
+        EventType.OPERATION_SUCCEEDED,
+    ]
+
+
+async def test_async_operation_builder_preserves_rate_limit_policy() -> None:
+    calls = 0
+
+    async def no_sleep(delay: float) -> None:
+        return None
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            raise ProviderRateLimitError(
+                "too many requests",
+                retry_after_seconds=0,
+            )
+
+        return "ok"
+
+    configured = (
+        async_operation("provider_call", operation)
+        .with_rate_limit(
+            RateLimitPolicy(
+                rate_limit_on=(ProviderRateLimitError,),
+                retry_after=provider_retry_after,
+            )
+        )
+        .with_validation(
+            validation_policy(
+                validator(
+                    "non_empty",
+                    lambda value: bool(value),
+                    message="Value must not be empty.",
+                )
+            )
+        )
+        .with_retry(
+            RetryPolicy(
+                max_attempts=2,
+                async_sleeper=no_sleep,
+            )
+        )
+    )
+
+    result = await configured.run()
+
+    assert result.value == "ok"
+    assert calls == 2
+    assert result.report.metadata["rate_limit_encountered"] is True
