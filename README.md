@@ -15,6 +15,12 @@ RelPrim helps you wrap external calls with retries, timeouts, fallbacks, validat
 pip install relprim
 ```
 
+OpenTelemetry integration is available as an optional extra:
+
+```bash
+pip install "relprim[otel]"
+```
+
 ## Wrap an external call in seconds
 
 ```python
@@ -96,6 +102,7 @@ Current primitives:
 * Event emitters
 * No-op event sink
 * In-memory event sink
+* OpenTelemetry event sink
 * Async operation builder API
 * Structured execution reports
 * Operation results
@@ -108,7 +115,6 @@ Current primitives:
 Planned primitives:
 
 * SQLite event store
-* OpenTelemetry exporter
 * JSON Schema validator adapter
 * Pydantic validator adapter
 
@@ -178,6 +184,36 @@ retry backoff otherwise. When the selected delay exceeds
 See the [rate-limit handling guide](docs/rate-limits.md) for delay selection,
 report metadata, structured events and limitations.
 
+## Export reliability events to OpenTelemetry
+
+RelPrim can export its structured lifecycle events to the currently active
+OpenTelemetry span.
+
+```python
+from relprim import EventEmitter, resilient
+from relprim.opentelemetry import OpenTelemetryEventSink
+
+
+event_emitter = EventEmitter(
+    sinks=(OpenTelemetryEventSink(),)
+)
+
+
+@resilient(
+    retries=3,
+    timeout=10,
+    events=event_emitter,
+)
+async def call_provider(prompt: str) -> str:
+    return await provider.generate(prompt)
+```
+
+The application remains responsible for configuring its OpenTelemetry SDK,
+tracer provider and exporter.
+
+See the [OpenTelemetry integration guide](docs/opentelemetry.md) for setup,
+exported attributes and limitations.
+
 ## Examples
 
 Practical examples are available in the [`examples`](examples) directory:
@@ -190,6 +226,7 @@ Practical examples are available in the [`examples`](examples) directory:
 * [`structured_events.py`](examples/structured_events.py) — operation lifecycle events with retry and validation
 * [`idempotency.py`](examples/idempotency.py) — duplicate execution prevention and result replay
 * [`rate_limit.py`](examples/rate_limit.py) — provider retry-after handling and maximum wait enforcement
+* [`opentelemetry_integration.py`](examples/opentelemetry_integration.py) — structured reliability events exported to an active OpenTelemetry span
 
 If you run examples from a cloned repository, install RelPrim in editable mode first:
 
@@ -210,6 +247,7 @@ PYTHONPATH=src python examples/decorator_usage.py
 * [Advanced usage](docs/advanced-usage.md)
 * [Idempotency](docs/idempotency.md)
 * [Rate-limit handling](docs/rate-limits.md)
+* [OpenTelemetry integration](docs/opentelemetry.md)
 
 ## Design principles
 

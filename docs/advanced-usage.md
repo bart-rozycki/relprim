@@ -2,7 +2,7 @@
 
 RelPrim exposes low-level primitives and a composable async operation builder for advanced reliability workflows.
 
-Use this API when you need explicit composition of retry, timeout, fallback, circuit breaker, validation, idempotency, rate-limit handling and structured events.
+Use this API when you need explicit composition of retry, timeout, fallback, circuit breaker, validation, idempotency, rate-limit handling, structured events and OpenTelemetry export.
 
 ## Builder API
 
@@ -196,6 +196,35 @@ for event in await event_sink.events():
 ```
 
 Events are transport-agnostic. They can be sent to logs, in-memory sinks, SQLite stores, OpenTelemetry exporters or custom observability systems.
+
+## OpenTelemetry event export
+
+Use `OpenTelemetryEventSink` to add RelPrim events to the currently active
+OpenTelemetry span:
+
+```python
+from relprim import EventEmitter, RetryPolicy, async_operation
+from relprim.opentelemetry import OpenTelemetryEventSink
+
+
+otel_events = EventEmitter(
+    sinks=(OpenTelemetryEventSink(),)
+)
+
+with tracer.start_as_current_span("request"):
+    result = await (
+        async_operation("generate_response", call_provider)
+        .with_retry(RetryPolicy(max_attempts=3))
+        .with_events(otel_events)
+        .run("Write a short product summary")
+    )
+```
+
+RelPrim does not configure the tracer provider or exporter. The application
+owns the OpenTelemetry SDK configuration.
+
+See the [OpenTelemetry integration guide](opentelemetry.md) for installation,
+event names, attributes and limitations.
 
 ## Idempotency
 
