@@ -238,22 +238,16 @@ from relprim import (
 )
 
 
-event_store = SQLiteEventStore(
-    "relprim-events.db"
-)
+event_store = SQLiteEventStore("relprim-events.db")
 
-event_emitter = EventEmitter(
-    sinks=(event_store,)
-)
+event_emitter = EventEmitter(sinks=(event_store,))
 
 result = await (
     async_operation(
         "generate_response",
         call_provider,
     )
-    .with_retry(
-        RetryPolicy(max_attempts=3)
-    )
+    .with_retry(RetryPolicy(max_attempts=3))
     .with_events(event_emitter)
     .run("Write a short product summary")
 )
