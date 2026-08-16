@@ -56,6 +56,16 @@ async def process_request(
     payload: dict[str, object],
 ) -> str:
     return await external_service.process(payload)
+```
+
+The first call executes the operation. Concurrent duplicate calls join it, and
+later calls replay its successful result.
+
+The default store is in-memory and coordinates calls only within one Python
+process.
+
+See the [idempotency guide](idempotency.md) before using idempotency for
+multi-process or distributed systems.
 
 ## Retry only selected exceptions
 
@@ -79,12 +89,6 @@ class TemporaryProviderError(Exception):
 async def call_provider(prompt: str) -> str:
     return await provider.generate(prompt)
 ```
-
-The first call executes the operation. Concurrent duplicate calls join it, and later calls replay its successful result.
-
-The default store is in-memory and coordinates calls only within one Python process.
-
-See the [idempotency guide](idempotency.md) before using idempotency for multi-process or distributed systems.
 
 ## Recover from provider rate limits
 
@@ -185,6 +189,49 @@ from relprim import ValidationFailedError, resilient
 async def call_provider(prompt: str) -> str:
     return await provider.generate(prompt)
 ```
+
+## Export events to OpenTelemetry
+
+Install the optional OpenTelemetry integration:
+
+```bash
+pip install "relprim[otel]"
+```
+
+Create an event sink:
+
+```python
+from relprim import EventEmitter, resilient
+from relprim.opentelemetry import OpenTelemetryEventSink
+
+
+event_emitter = EventEmitter(sinks=(OpenTelemetryEventSink(),))
+
+
+@resilient(
+    retries=3,
+    timeout=10,
+    events=event_emitter,
+)
+async def call_provider(prompt: str) -> str:
+    return await provider.generate(prompt)
+```
+
+Run the operation inside an active span created by the application's
+OpenTelemetry configuration:
+
+```python
+with tracer.start_as_current_span("request"):
+    result = await call_provider("Write a short product summary")
+```
+
+RelPrim adds its structured lifecycle events to that span.
+
+The application remains responsible for configuring the OpenTelemetry SDK and
+exporter.
+
+See the [OpenTelemetry integration guide](opentelemetry.md) for complete setup,
+attribute mapping and limitations.
 
 ## Use advanced policies when you need control
 
