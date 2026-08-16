@@ -88,9 +88,7 @@ The operation must execute while an OpenTelemetry span is active:
 
 ```python
 with tracer.start_as_current_span("request"):
-    result = await call_provider(
-        "Write a short product summary"
-    )
+    result = await call_provider("Write a short product summary")
 ```
 
 RelPrim events are added to the active `request` span.
@@ -184,9 +182,7 @@ from relprim import EventEmitter, RetryPolicy, async_operation
 from relprim.opentelemetry import OpenTelemetryEventSink
 
 
-event_emitter = EventEmitter(
-    sinks=(OpenTelemetryEventSink(),)
-)
+event_emitter = EventEmitter(sinks=(OpenTelemetryEventSink(),))
 
 with tracer.start_as_current_span("request"):
     result = await (

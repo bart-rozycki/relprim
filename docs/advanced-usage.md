@@ -207,9 +207,7 @@ from relprim import EventEmitter, RetryPolicy, async_operation
 from relprim.opentelemetry import OpenTelemetryEventSink
 
 
-otel_events = EventEmitter(
-    sinks=(OpenTelemetryEventSink(),)
-)
+otel_events = EventEmitter(sinks=(OpenTelemetryEventSink(),))
 
 with tracer.start_as_current_span("request"):
     result = await (

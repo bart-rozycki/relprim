@@ -205,9 +205,7 @@ from relprim import EventEmitter, resilient
 from relprim.opentelemetry import OpenTelemetryEventSink
 
 
-event_emitter = EventEmitter(
-    sinks=(OpenTelemetryEventSink(),)
-)
+event_emitter = EventEmitter(sinks=(OpenTelemetryEventSink(),))
 
 
 @resilient(
@@ -224,9 +222,7 @@ OpenTelemetry configuration:
 
 ```python
 with tracer.start_as_current_span("request"):
-    result = await call_provider(
-        "Write a short product summary"
-    )
+    result = await call_provider("Write a short product summary")
 ```
 
 RelPrim adds its structured lifecycle events to that span.

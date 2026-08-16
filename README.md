@@ -194,9 +194,7 @@ from relprim import EventEmitter, resilient
 from relprim.opentelemetry import OpenTelemetryEventSink
 
 
-event_emitter = EventEmitter(
-    sinks=(OpenTelemetryEventSink(),)
-)
+event_emitter = EventEmitter(sinks=(OpenTelemetryEventSink(),))
 
 
 @resilient(
