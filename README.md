@@ -102,6 +102,7 @@ Current primitives:
 * Event emitters
 * No-op event sink
 * In-memory event sink
+* SQLite event store and persistent event history
 * OpenTelemetry event sink
 * Async operation builder API
 * Structured execution reports
@@ -114,7 +115,6 @@ Current primitives:
 
 Planned primitives:
 
-* SQLite event store
 * JSON Schema validator adapter
 * Pydantic validator adapter
 
@@ -184,6 +184,39 @@ retry backoff otherwise. When the selected delay exceeds
 See the [rate-limit handling guide](docs/rate-limits.md) for delay selection,
 report metadata, structured events and limitations.
 
+## Persist structured event history
+
+RelPrim can persist structured lifecycle events in a local SQLite database.
+
+```python
+from relprim import EventEmitter, SQLiteEventStore, resilient
+
+
+event_store = SQLiteEventStore("relprim-events.db")
+event_emitter = EventEmitter(sinks=(event_store,))
+
+
+@resilient(
+    retries=3,
+    timeout=10,
+    events=event_emitter,
+)
+async def call_provider(prompt: str) -> str:
+    return await provider.generate(prompt)
+```
+
+Stored events can be queried later:
+
+```python
+history = await event_store.history(
+    operation_name="call_provider",
+    limit=100,
+)
+```
+
+See the [SQLite event store guide](docs/sqlite-event-store.md) for filtering,
+pagination, retention and storage limitations.
+
 ## Export reliability events to OpenTelemetry
 
 RelPrim can export its structured lifecycle events to the currently active
@@ -224,6 +257,7 @@ Practical examples are available in the [`examples`](examples) directory:
 * [`structured_events.py`](examples/structured_events.py) — operation lifecycle events with retry and validation
 * [`idempotency.py`](examples/idempotency.py) — duplicate execution prevention and result replay
 * [`rate_limit.py`](examples/rate_limit.py) — provider retry-after handling and maximum wait enforcement
+* [`sqlite_event_store.py`](examples/sqlite_event_store.py) — durable structured events and basic history queries
 * [`opentelemetry_integration.py`](examples/opentelemetry_integration.py) — structured reliability events exported to an active OpenTelemetry span
 
 If you run examples from a cloned repository, install RelPrim in editable mode first:
@@ -245,6 +279,7 @@ PYTHONPATH=src python examples/decorator_usage.py
 * [Advanced usage](docs/advanced-usage.md)
 * [Idempotency](docs/idempotency.md)
 * [Rate-limit handling](docs/rate-limits.md)
+* [SQLite event store](docs/sqlite-event-store.md)
 * [OpenTelemetry integration](docs/opentelemetry.md)
 
 ## Design principles

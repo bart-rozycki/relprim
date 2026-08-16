@@ -233,6 +233,56 @@ exporter.
 See the [OpenTelemetry integration guide](opentelemetry.md) for complete setup,
 attribute mapping and limitations.
 
+## Persist event history locally
+
+Structured events can also be stored in SQLite:
+
+```python
+from relprim import (
+    EventEmitter,
+    SQLiteEventStore,
+    resilient,
+)
+
+
+event_store = SQLiteEventStore(
+    "relprim-events.db"
+)
+
+event_emitter = EventEmitter(
+    sinks=(event_store,)
+)
+
+
+@resilient(
+    retries=3,
+    timeout=10,
+    events=event_emitter,
+)
+async def call_provider(prompt: str) -> str:
+    return await provider.generate(prompt)
+```
+
+Query the persisted history later:
+
+```python
+history = await event_store.history(
+    operation_name="call_provider",
+    limit=100,
+)
+
+for stored in history:
+    print(
+        stored.sequence_id,
+        stored.event.to_dict(),
+    )
+```
+
+The SQLite store is intended for local and single-host persistence.
+
+See the [SQLite event store guide](sqlite-event-store.md) for filters,
+pagination, retention and storage limitations.
+
 ## Use advanced policies when you need control
 
 The simple decorator options are designed for fast adoption.
