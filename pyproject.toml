@@ -28,6 +28,9 @@ keywords = [
     "deduplication",
     "rate-limiting",
     "retry-after",
+    "opentelemetry",
+    "observability",
+    "tracing",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -46,6 +49,11 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "ruff>=0.8.0",
     "mypy>=1.10.0",
+    "opentelemetry-api>=1.24.0,<2.0.0",
+    "opentelemetry-sdk>=1.24.0,<2.0.0",
+]
+otel = [
+    "opentelemetry-api>=1.24.0,<2.0.0",
 ]
 
 [tool.ruff]
