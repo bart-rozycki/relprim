@@ -224,6 +224,70 @@ owns the OpenTelemetry SDK configuration.
 See the [OpenTelemetry integration guide](opentelemetry.md) for installation,
 event names, attributes and limitations.
 
+## SQLite event history
+
+Use `SQLiteEventStore` when structured reliability events should survive
+process restarts and remain available for local inspection.
+
+```python
+from relprim import (
+    EventEmitter,
+    RetryPolicy,
+    SQLiteEventStore,
+    async_operation,
+)
+
+
+event_store = SQLiteEventStore(
+    "relprim-events.db"
+)
+
+event_emitter = EventEmitter(
+    sinks=(event_store,)
+)
+
+result = await (
+    async_operation(
+        "generate_response",
+        call_provider,
+    )
+    .with_retry(
+        RetryPolicy(max_attempts=3)
+    )
+    .with_events(event_emitter)
+    .run("Write a short product summary")
+)
+```
+
+Read the stored history:
+
+```python
+history = await event_store.history(
+    operation_name="generate_response",
+    limit=100,
+)
+```
+
+Filter by event type when only specific lifecycle transitions are relevant:
+
+```python
+from relprim import EventType
+
+
+failures = await event_store.history(
+    event_types=(
+        EventType.ATTEMPT_FAILED,
+        EventType.OPERATION_FAILED,
+    ),
+)
+```
+
+The SQLite store also supports sequence-based pagination and timestamp-based
+retention.
+
+See the [SQLite event store guide](sqlite-event-store.md) for the complete API
+and limitations.
+
 ## Idempotency
 
 Idempotency can coordinate the entire operation lifecycle under one logical key.
