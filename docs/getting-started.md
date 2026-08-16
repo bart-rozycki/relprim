@@ -245,13 +245,9 @@ from relprim import (
 )
 
 
-event_store = SQLiteEventStore(
-    "relprim-events.db"
-)
+event_store = SQLiteEventStore("relprim-events.db")
 
-event_emitter = EventEmitter(
-    sinks=(event_store,)
-)
+event_emitter = EventEmitter(sinks=(event_store,))
 
 
 @resilient(

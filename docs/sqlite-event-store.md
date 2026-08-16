@@ -19,9 +19,7 @@ from relprim import (
 
 event_store = SQLiteEventStore("relprim-events.db")
 
-event_emitter = EventEmitter(
-    sinks=(event_store,)
-)
+event_emitter = EventEmitter(sinks=(event_store,))
 
 
 @resilient(
@@ -120,9 +118,7 @@ from datetime import UTC, datetime, timedelta
 
 cutoff = datetime.now(UTC) - timedelta(days=30)
 
-deleted = await event_store.delete_before(
-    cutoff
-)
+deleted = await event_store.delete_before(cutoff)
 
 print(f"Deleted {deleted} events")
 ```
