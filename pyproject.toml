@@ -31,6 +31,8 @@ keywords = [
     "opentelemetry",
     "observability",
     "tracing",
+    "sqlite",
+    "event-store",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

@@ -121,3 +121,7 @@ class RetryAfterExtractionError(RelPrimError):
         super().__init__(message)
         self.rate_limit_error = rate_limit_error
         self.cause = cause
+
+
+class SQLiteEventStoreSchemaError(RelPrimError):
+    """Raised when a SQLite event-store schema cannot be used safely."""

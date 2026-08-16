@@ -13,6 +13,7 @@ from relprim.errors import (
     RelPrimError,
     RetryAfterExtractionError,
     RetryError,
+    SQLiteEventStoreSchemaError,
     ValidationFailedError,
 )
 from relprim.events import (
@@ -54,6 +55,10 @@ from relprim.report import (
 )
 from relprim.result import OperationResult
 from relprim.retry import ExponentialBackoff, RetryAttempt, RetryPolicy
+from relprim.sqlite_events import (
+    SQLiteEventStore,
+    StoredEvent,
+)
 from relprim.timeout import TimeoutPolicy
 from relprim.validation import (
     CallableValidator,
@@ -104,6 +109,9 @@ __all__ = [
     "RetryAttempt",
     "RetryError",
     "RetryPolicy",
+    "SQLiteEventStore",
+    "SQLiteEventStoreSchemaError",
+    "StoredEvent",
     "StructuredEvent",
     "TimeoutPolicy",
     "ValidationFailedError",
