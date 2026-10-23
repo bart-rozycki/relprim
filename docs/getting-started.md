@@ -190,6 +190,36 @@ async def call_provider(prompt: str) -> str:
     return await provider.generate(prompt)
 ```
 
+## Validate against a schema or model
+
+Callable validators are the dependency-free default.
+
+If your responses already have a JSON Schema or a Pydantic model, install an
+optional adapter:
+
+```bash
+pip install "relprim[jsonschema]"
+pip install "relprim[pydantic]"
+```
+
+The adapters are validators, so they go into the same `validation_policy(...)`:
+
+```python
+from relprim import resilient, validation_policy
+from relprim.pydantic import pydantic_validator
+
+
+@resilient(
+    retries=2,
+    validation=validation_policy(pydantic_validator(ProviderResponse)),
+)
+async def call_provider(prompt: str) -> dict[str, object]:
+    return await provider.generate(prompt)
+```
+
+See the [JSON Schema validation guide](json-schema-validation.md) and the
+[Pydantic validation guide](pydantic-validation.md).
+
 ## Export events to OpenTelemetry
 
 Install the optional OpenTelemetry integration:

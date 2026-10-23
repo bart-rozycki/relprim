@@ -171,6 +171,31 @@ result = await (
 
 Validation failures are captured in execution reports.
 
+Optional JSON Schema and Pydantic adapters implement the same `Validator`
+protocol. Combine them with other validators in one policy:
+
+```python
+from relprim.jsonschema import json_schema_validator
+from relprim.pydantic import pydantic_validator
+
+
+response_validation = validation_policy(
+    json_schema_validator(PROVIDER_RESPONSE_SCHEMA, name="provider_response"),
+    pydantic_validator(ProviderResponse),
+)
+
+result = await (
+    async_operation("fetch_user", fetch_user).with_validation(response_validation).run(42)
+)
+```
+
+Validators run in order and stop at the first failure. The adapters validate
+results without converting them.
+
+See the [JSON Schema validation guide](json-schema-validation.md) and the
+[Pydantic validation guide](pydantic-validation.md) for installation, error
+messages and limitations.
+
 ## Structured events
 
 RelPrim can emit structured lifecycle events from async operations.
