@@ -21,6 +21,13 @@ OpenTelemetry integration is available as an optional extra:
 pip install "relprim[otel]"
 ```
 
+JSON Schema and Pydantic validator adapters are also optional:
+
+```bash
+pip install "relprim[jsonschema]"
+pip install "relprim[pydantic]"
+```
+
 ## Wrap an external call in seconds
 
 ```python
@@ -98,6 +105,8 @@ Current primitives:
 * Async circuit breakers
 * Validation policies
 * Callable validators
+* JSON Schema validator adapter
+* Pydantic validator adapter
 * Structured events
 * Event emitters
 * No-op event sink
@@ -113,11 +122,57 @@ Current primitives:
 * Successful result replay
 * In-memory idempotency store
 
-Planned primitives:
+Future features will be driven by user feedback.
 
-* JSON Schema validator adapter
-* Pydantic validator adapter
+## Validate responses with JSON Schema or Pydantic
 
+Plain callable validators are dependency-free. When responses already have a
+schema or model, optional adapters plug into the same validation policy.
+
+JSON Schema:
+
+```python
+from relprim import resilient, validation_policy
+from relprim.jsonschema import json_schema_validator
+
+
+schema = {
+    "type": "object",
+    "required": ["id", "name"],
+    "properties": {"id": {"type": "integer"}, "name": {"type": "string"}},
+}
+
+
+@resilient(retries=2, validation=validation_policy(json_schema_validator(schema)))
+async def fetch_user(user_id: int) -> dict[str, object]:
+    return await provider.fetch_user(user_id)
+```
+
+Pydantic:
+
+```python
+from pydantic import BaseModel
+
+from relprim import resilient, validation_policy
+from relprim.pydantic import pydantic_validator
+
+
+class User(BaseModel):
+    id: int
+    name: str
+
+
+@resilient(retries=2, validation=validation_policy(pydantic_validator(User)))
+async def fetch_user(user_id: int) -> dict[str, object]:
+    return await provider.fetch_user(user_id)
+```
+
+Invalid responses fail with `ValidationFailedError` and a concise reason such as
+`'name' is a required property (path: $)`. Results are validated, never
+converted.
+
+See the [JSON Schema validation guide](docs/json-schema-validation.md) and the
+[Pydantic validation guide](docs/pydantic-validation.md) for details.
 
 ## Prevent duplicate executions
 
@@ -254,6 +309,8 @@ Practical examples are available in the [`examples`](examples) directory:
 * [`fallback_chain.py`](examples/fallback_chain.py) — primary provider failure with fallback execution
 * [`circuit_breaker.py`](examples/circuit_breaker.py) — circuit breaker protection with fallback behavior
 * [`validation.py`](examples/validation.py) — result validation with retry support
+* [`json_schema_validation.py`](examples/json_schema_validation.py) — JSON Schema response validation with retry recovery
+* [`pydantic_validation.py`](examples/pydantic_validation.py) — Pydantic response validation with fallback recovery
 * [`structured_events.py`](examples/structured_events.py) — operation lifecycle events with retry and validation
 * [`idempotency.py`](examples/idempotency.py) — duplicate execution prevention and result replay
 * [`rate_limit.py`](examples/rate_limit.py) — provider retry-after handling and maximum wait enforcement
@@ -281,6 +338,8 @@ PYTHONPATH=src python examples/decorator_usage.py
 * [Rate-limit handling](docs/rate-limits.md)
 * [SQLite event store](docs/sqlite-event-store.md)
 * [OpenTelemetry integration](docs/opentelemetry.md)
+* [JSON Schema validation](docs/json-schema-validation.md)
+* [Pydantic validation](docs/pydantic-validation.md)
 
 ## Design principles
 

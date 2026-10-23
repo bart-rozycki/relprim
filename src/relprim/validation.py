@@ -52,7 +52,9 @@ class ValidationResult:
 class Validator(Protocol[T_contra]):
     """Protocol implemented by value validators."""
 
-    name: str
+    @property
+    def name(self) -> str:
+        """Validator name reported in validation results."""
 
     def validate(self, value: T_contra) -> ValidationResult:
         """Validate a value and return a structured validation result."""
@@ -65,8 +67,9 @@ class CallableValidator(Generic[T]):
     The callable should return True when the value is acceptable and False when
     it is invalid.
 
-    This intentionally keeps the first validation primitive dependency-free.
-    JSON Schema, Pydantic and semantic validators can be added later as adapters.
+    This intentionally keeps the default validation primitive dependency-free.
+    Optional JSON Schema and Pydantic adapters live in relprim.jsonschema and
+    relprim.pydantic.
     """
 
     name: str
