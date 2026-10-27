@@ -617,7 +617,7 @@ def test_resilient_decorator_rejects_non_positive_idempotency_ttl() -> None:
 
     with pytest.raises(
         ValueError,
-        match="ttl_seconds must be greater than 0",
+        match="idempotency_ttl must be greater than 0",
     ):
         define_operation()
 
@@ -748,3 +748,43 @@ async def test_resilient_decorator_accepts_simple_rate_limit_options() -> None:
     assert result.report.metadata["rate_limit_encountered"] is True
     assert result.report.metadata["rate_limit_wait_seconds"] == 2
     assert result.report.metadata["rate_limit_wait_exceeded"] is False
+
+
+def test_resilient_decorator_rejects_retry_on_without_retries() -> None:
+    with pytest.raises(ValueError, match="retry_on requires retries"):
+        resilient(retry_on=(ValueError,))
+
+
+def test_resilient_decorator_rejects_retry_on_with_retry_policy() -> None:
+    with pytest.raises(ValueError, match="retry_on cannot be combined with retry"):
+        resilient(retry=RetryPolicy(), retry_on=(ValueError,))
+
+
+def test_resilient_decorator_rejects_base_exception_retry_on() -> None:
+    with pytest.raises(TypeError, match="retry_on must contain Exception subclasses"):
+        resilient(retries=1, retry_on=(BaseException,))  # type: ignore[arg-type]
+
+
+def test_resilient_decorator_rejects_bool_retries() -> None:
+    with pytest.raises(TypeError, match="retries must be an int"):
+        resilient(retries=True)
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf")])
+def test_resilient_decorator_rejects_non_finite_timeout(timeout: float) -> None:
+    with pytest.raises(ValueError, match="timeout must be finite"):
+        resilient(timeout=timeout)
+
+
+async def test_resilient_decorator_result_includes_fallback_value() -> None:
+    async def backup(user_id: int) -> str:
+        return f"backup:{user_id}"
+
+    @resilient(fallback=backup)
+    async def load(user_id: int) -> str:
+        raise RuntimeError("primary down")
+
+    result = await load(7)
+
+    assert result.value == "backup:7"
+    assert result.report.metadata["fallback_candidate_name"] == "backup"

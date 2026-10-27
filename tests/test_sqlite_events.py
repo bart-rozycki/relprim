@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 
 import pytest
@@ -455,3 +455,133 @@ async def test_sqlite_event_store_requires_timezone_aware_retention_timestamp(
         match="before must be timezone-aware",
     ):
         await store.delete_before(datetime(2026, 1, 1))
+
+
+class NoOffsetTimezone(tzinfo):
+    """A tzinfo that makes datetimes naive: utcoffset() returns None."""
+
+    def utcoffset(self, dt: datetime | None) -> None:
+        return None
+
+    def dst(self, dt: datetime | None) -> None:
+        return None
+
+    def tzname(self, dt: datetime | None) -> str:
+        return "unknown"
+
+
+async def test_sqlite_event_store_rejects_retention_timestamp_without_utc_offset(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteEventStore(tmp_path / "events.db")
+
+    with pytest.raises(ValueError, match="before must be timezone-aware"):
+        await store.delete_before(datetime(2026, 1, 1, tzinfo=NoOffsetTimezone()))
+
+
+async def test_sqlite_event_store_retention_accepts_utc_and_offset_timestamps(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteEventStore(tmp_path / "events.db")
+    await store.emit(event(timestamp=datetime(2026, 1, 1, 12, 0, tzinfo=UTC)))
+    await store.emit(event(timestamp=datetime(2026, 1, 1, 14, 0, tzinfo=UTC)))
+    await store.emit(event(timestamp=datetime(2026, 1, 1, 16, 0, tzinfo=UTC)))
+
+    # 15:00 at UTC+2 is 13:00 UTC, so only the 12:00 UTC event is older.
+    plus_two = timezone(timedelta(hours=2))
+    assert await store.delete_before(datetime(2026, 1, 1, 15, 0, tzinfo=plus_two)) == 1
+    assert await store.delete_before(datetime(2026, 1, 1, 15, 0, tzinfo=UTC)) == 1
+    assert len(await store.history()) == 1
+
+
+async def test_sqlite_event_store_reads_database_written_by_0_11(tmp_path: Path) -> None:
+    database = tmp_path / "events.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE relprim_schema (component TEXT PRIMARY KEY, version INTEGER NOT NULL);
+        INSERT INTO relprim_schema VALUES ('event_store', 1);
+        CREATE TABLE relprim_events (
+            sequence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            operation_name TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        );
+        INSERT INTO relprim_events (event_type, operation_name, timestamp, payload_json)
+        VALUES (
+            'retry.scheduled',
+            'provider_call',
+            '2026-01-01T12:00:00.000000+00:00',
+            '{"attempt_number":1,"delay_seconds":0.5,"delay_source":"backoff","rate_limited":false,"retry_after_seconds":null}'
+        );
+        """
+    )
+    connection.close()
+
+    store = SQLiteEventStore(database)
+    (stored,) = await store.history()
+
+    assert stored.sequence_id == 1
+    assert stored.event.event_type is EventType.RETRY_SCHEDULED
+    assert stored.event.timestamp == datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    assert dict(stored.event.payload) == {
+        "attempt_number": 1,
+        "delay_seconds": 0.5,
+        "delay_source": "backoff",
+        "rate_limited": False,
+        "retry_after_seconds": None,
+    }
+
+
+async def test_sqlite_event_store_round_trips_non_utc_timestamps_and_unicode(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteEventStore(tmp_path / "events.db")
+    timestamp = datetime(2026, 1, 1, 14, 0, 0, 1, tzinfo=timezone(timedelta(hours=2)))
+    original = event(
+        operation_name="zażółć gęślą jaźń",
+        timestamp=timestamp,
+        payload={"reason": "błąd 🚨", "big": 2**53, "ratio": 0.1, "flag": True, "none": None},
+    )
+
+    await store.emit(original)
+    (stored,) = await store.history()
+
+    assert stored.event == original
+    assert stored.event.timestamp.utcoffset() == timedelta(0)
+
+
+def test_sqlite_event_stores_compare_by_identity(tmp_path: Path) -> None:
+    first = SQLiteEventStore(tmp_path / "events.db")
+    second = SQLiteEventStore(tmp_path / "events.db")
+
+    assert first != second
+    assert len({first, second}) == 2
+
+
+async def test_sqlite_event_store_enables_wal_mode(tmp_path: Path) -> None:
+    database = tmp_path / "events.db"
+
+    await SQLiteEventStore(database).initialize()
+
+    connection = sqlite3.connect(database)
+    try:
+        (journal_mode,) = connection.execute("PRAGMA journal_mode").fetchone()
+    finally:
+        connection.close()
+
+    assert journal_mode == "wal"
+
+
+async def test_concurrent_first_initialization_of_one_database(tmp_path: Path) -> None:
+    # Several stores, workers or processes may create the same database at once.
+    database = tmp_path / "events.db"
+    stores = [SQLiteEventStore(database) for _ in range(8)]
+
+    await asyncio.gather(
+        *(store.emit(event(payload={"store": index})) for index, store in enumerate(stores))
+    )
+
+    history = await stores[0].history()
+    assert sorted(stored.event.payload["store"] for stored in history) == list(range(8))

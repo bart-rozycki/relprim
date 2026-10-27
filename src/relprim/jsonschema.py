@@ -2,11 +2,21 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
-from jsonschema.exceptions import ValidationError, best_match
-from jsonschema.protocols import Validator as SchemaValidator
-from jsonschema.validators import validator_for
+try:
+    from jsonschema.exceptions import ValidationError, best_match
+    from jsonschema.protocols import Validator as SchemaValidator
+    from jsonschema.validators import validator_for
+except ModuleNotFoundError as exc:
+    if exc.name is None or exc.name.split(".")[0] != "jsonschema":
+        raise
+
+    raise ModuleNotFoundError(
+        "relprim.jsonschema requires the optional 'jsonschema' package. "
+        "Install it with: pip install 'relprim[jsonschema]'",
+        name=exc.name,
+    ) from exc
 
 from relprim.validation import ValidationResult
 
@@ -46,8 +56,11 @@ class JSONSchemaValidator:
         validator_class.check_schema(dict(self.schema))
         object.__setattr__(self, "_schema_validator", validator_class(self.schema))
 
-    def validate(self, value: Any) -> ValidationResult:
-        error: ValidationError | None = best_match(self._schema_validator.iter_errors(value))
+    def validate(self, value: object) -> ValidationResult:
+        # jsonschema's stubs describe JSON inputs, but any value is accepted at
+        # runtime and non-JSON values fail the schema's type checks.
+        instance = cast(Any, value)
+        error: ValidationError | None = best_match(self._schema_validator.iter_errors(instance))
 
         if error is None:
             return ValidationResult.success(validator_name=self.name)

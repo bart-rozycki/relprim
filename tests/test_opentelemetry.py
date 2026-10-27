@@ -141,3 +141,26 @@ async def test_opentelemetry_event_sink_exports_operation_lifecycle(
         "relprim.attempt.succeeded",
         "relprim.operation.succeeded",
     ]
+
+
+def test_opentelemetry_timestamp_conversion_is_exact() -> None:
+    from relprim.opentelemetry import _timestamp_ns
+
+    timestamp = datetime(2026, 1, 1, 12, 0, 0, 123456, tzinfo=UTC)
+
+    assert _timestamp_ns(timestamp) == 1_767_268_800_123_456_000
+
+
+async def test_opentelemetry_sink_never_installs_a_global_tracer_provider() -> None:
+    before = trace.get_tracer_provider()
+
+    async def operation() -> str:
+        return "ok"
+
+    await (
+        async_operation("provider_call", operation)
+        .with_events(EventEmitter(sinks=(OpenTelemetryEventSink(),)))
+        .run()
+    )
+
+    assert trace.get_tracer_provider() is before

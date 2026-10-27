@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import ParamSpec, TypeAlias, TypeVar
 
+from relprim._checks import check_exception_types, check_seconds
 from relprim.errors import CircuitBreakerOpenError
 
 P = ParamSpec("P")
@@ -48,7 +49,7 @@ class CircuitBreakerSnapshot:
         return self.state is CircuitBreakerState.HALF_OPEN
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class CircuitBreaker:
     """Async circuit breaker for protecting unstable external operations.
 
@@ -62,14 +63,22 @@ class CircuitBreaker:
     - HALF_OPEN: after the recovery timeout, a single probe call is allowed.
       If it succeeds, the breaker closes. If it fails, the breaker opens again.
 
+    Exceptions that do not match `record_failure_on` are neither failures nor
+    successes: they do not change the failure count. A cancelled call is
+    treated the same way, and a cancelled half-open probe releases its probe
+    slot so the next call can probe again.
+
     This primitive is intentionally async-first and uses an asyncio lock to
     prevent concurrent half-open probes from stampeding a recovering dependency.
+
+    A breaker is a shared stateful object: reuse one instance for every call
+    that should share failure accounting. Breakers compare by identity.
     """
 
     name: str = "default"
     failure_threshold: int = 5
     recovery_timeout_seconds: float = 30.0
-    record_failure_on: tuple[type[BaseException], ...] = (Exception,)
+    record_failure_on: tuple[type[Exception], ...] = (Exception,)
     clock: Clock = time.monotonic
 
     _state: CircuitBreakerState = field(
@@ -85,12 +94,12 @@ class CircuitBreaker:
     def __post_init__(self) -> None:
         if not self.name.strip():
             raise ValueError("name must not be empty.")
+        if isinstance(self.failure_threshold, bool) or not isinstance(self.failure_threshold, int):
+            raise TypeError("failure_threshold must be an int.")
         if self.failure_threshold < 1:
             raise ValueError("failure_threshold must be greater than or equal to 1.")
-        if self.recovery_timeout_seconds <= 0:
-            raise ValueError("recovery_timeout_seconds must be greater than 0.")
-        if not self.record_failure_on:
-            raise ValueError("record_failure_on must contain at least one exception type.")
+        check_seconds(self.recovery_timeout_seconds, "recovery_timeout_seconds", allow_zero=False)
+        check_exception_types(self.record_failure_on, "record_failure_on")
 
     async def run_async(
         self,
@@ -99,12 +108,21 @@ class CircuitBreaker:
         **kwargs: P.kwargs,
     ) -> R:
         """Run an async operation through the circuit breaker."""
-        await self._before_call()
+        probe = await self._before_call()
 
         try:
             result = await operation(*args, **kwargs)
         except Exception as exc:
             await self._after_failure(exc)
+            raise
+        except BaseException:
+            # Cancellation is not an outcome of the protected call. Release the
+            # probe slot synchronously: awaiting the lock here could be
+            # interrupted by a second cancellation and leave the slot occupied.
+            # No critical section awaits while holding the lock, so this
+            # cannot interleave with one.
+            if probe:
+                self._half_open_probe_in_flight = False
             raise
 
         await self._after_success()
@@ -128,7 +146,8 @@ class CircuitBreaker:
         async with self._lock:
             self._close()
 
-    async def _before_call(self) -> None:
+    async def _before_call(self) -> bool:
+        """Admit or reject a call. Returns True when the call is a half-open probe."""
         async with self._lock:
             now = self.clock()
 
@@ -139,7 +158,7 @@ class CircuitBreaker:
                     if elapsed >= self.recovery_timeout_seconds:
                         self._state = CircuitBreakerState.HALF_OPEN
                         self._half_open_probe_in_flight = True
-                        return
+                        return True
 
                     retry_after_seconds = max(0.0, self.recovery_timeout_seconds - elapsed)
                 else:
@@ -152,7 +171,9 @@ class CircuitBreaker:
                     raise self._open_error(retry_after_seconds=None)
 
                 self._half_open_probe_in_flight = True
-                return
+                return True
+
+            return False
 
     async def _after_success(self) -> None:
         async with self._lock:
@@ -196,6 +217,6 @@ class CircuitBreaker:
         return CircuitBreakerOpenError(
             f"Circuit breaker '{self.name}' is {self._state.value}.",
             breaker_name=self.name,
-            state=self._state.value,
+            state=self._state,
             retry_after_seconds=retry_after_seconds,
         )

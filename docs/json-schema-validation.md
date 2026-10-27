@@ -114,7 +114,8 @@ jsonschema version.
 
 The schema is checked against its metaschema when the validator is created.
 
-An invalid schema raises `jsonschema.exceptions.SchemaError` immediately:
+An invalid schema raises `jsonschema.exceptions.SchemaError` immediately. RelPrim
+does not wrap it:
 
 ```python
 json_schema_validator({"type": "not-a-real-type"})  # raises SchemaError
@@ -146,6 +147,12 @@ for the same schema and value.
 
 Messages longer than 200 characters are truncated, so large invalid values are
 not copied into reports and events.
+
+jsonschema messages can quote the invalid value itself, as in
+`123 is not of type 'string'`. Up to 200 characters of it can therefore
+appear in the reason, which is stored in execution reports and structured
+events. If validated values may contain secrets, prefer a schema whose
+failures do not quote them, or use a custom validator with its own reasons.
 
 ## Retry and fallback
 
@@ -194,7 +201,12 @@ structured validation events.
 
 ## Dependency model
 
-`jsonschema` is an optional dependency.
+`jsonschema` is an optional dependency. Supported versions are
+`>=4.3.0,<5.0.0`; the minimum version is tested in CI.
+
+`JSONSchemaValidator` accepts values of any type, so
+`validation_policy(json_schema_validator(...))` is a `ValidationPolicy[object]`
+that type-checks with operations returning any type.
 
 `import relprim` never imports it. Only `relprim.jsonschema` requires it, so
 the core package remains dependency-free.

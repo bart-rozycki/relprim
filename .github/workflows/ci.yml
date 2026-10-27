@@ -6,20 +6,24 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   quality:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -28,13 +32,67 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
+      - name: Check formatting
+        run: ruff format --check .
+
       - name: Run ruff
-        run: |
-          ruff check .
-          ruff format --check .
+        run: ruff check .
 
       - name: Run mypy
-        run: mypy src
+        run: mypy src --python-version ${{ matrix.python-version }}
 
       - name: Run tests
         run: pytest
+
+  minimum-dependencies:
+    # Verifies the lower bounds declared for the optional extras.
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install minimum supported dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . \
+            "opentelemetry-api==1.24.0" \
+            "opentelemetry-sdk==1.24.0" \
+            "jsonschema==4.3.0" \
+            "pydantic==2.0" \
+            pytest \
+            pytest-asyncio
+
+      - name: Run tests
+        run: pytest
+
+  package:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build distributions
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          twine check --strict dist/*
+
+      - name: Verify distributions in clean environments
+        run: scripts/verify-dist.sh dist

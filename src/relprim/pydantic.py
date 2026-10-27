@@ -3,7 +3,17 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from pydantic import BaseModel, ValidationError
+try:
+    from pydantic import BaseModel, ValidationError
+except ModuleNotFoundError as exc:
+    if exc.name is None or exc.name.split(".")[0] != "pydantic":
+        raise
+
+    raise ModuleNotFoundError(
+        "relprim.pydantic requires the optional 'pydantic' package. "
+        "Install it with: pip install 'relprim[pydantic]'",
+        name=exc.name,
+    ) from exc
 
 from relprim.validation import ValidationResult
 

@@ -139,12 +139,15 @@ relprim.payload.rate_limited = false
 ```
 
 Payload values equal to `None` are omitted because they are not valid
-OpenTelemetry attributes.
+OpenTelemetry attributes. Every other payload value is a string, boolean,
+integer or finite float, which are valid attribute values. Attribute names are
+part of the [events and metadata contract](events-and-metadata.md).
 
 ## Event timestamps
 
 The original timezone-aware `StructuredEvent.timestamp` is used as the
-OpenTelemetry span event timestamp.
+OpenTelemetry span event timestamp, converted to integer nanoseconds without
+floating-point rounding.
 
 The sink does not replace it with the time at which the exporter processes the
 event.
@@ -205,7 +208,8 @@ span or the application has not installed an SDK.
 
 ## Dependency model
 
-The `relprim[otel]` extra installs `opentelemetry-api`.
+The `relprim[otel]` extra installs `opentelemetry-api` (`>=1.24.0,<2.0.0`).
+The minimum version is tested in CI.
 
 It does not install:
 
@@ -227,7 +231,11 @@ work without the optional extra.
 
 ## Scope and limitations
 
-RelPrim 0.10.0 exports structured events to an already active span.
+`OpenTelemetryEventSink` exports structured events to an already active
+span. Its `emit()` is synchronous apart from the `async` signature, so it
+cannot be interrupted by cancellation halfway through. Concurrent operations
+running in different spans or tasks only add events to their own current
+span.
 
 It does not:
 

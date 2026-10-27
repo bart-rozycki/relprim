@@ -4,17 +4,18 @@ import asyncio
 import json
 import math
 import sqlite3
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypeAlias
 
+from relprim._checks import JsonScalar, check_aware, check_seconds
 from relprim.errors import SQLiteEventStoreSchemaError
 from relprim.events import (
     EventPayload,
     EventType,
-    JsonScalar,
     StructuredEvent,
 )
 
@@ -23,6 +24,8 @@ Migration: TypeAlias = Callable[[sqlite3.Connection], None]
 
 _SCHEMA_COMPONENT = "event_store"
 _SCHEMA_VERSION = 1
+_BUSY_ERROR_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+_WAL_RETRY_INTERVAL_SECONDS = 0.01
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +80,7 @@ _MIGRATIONS: dict[int, Migration] = {
 }
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class SQLiteEventStore:
     """Durable SQLite event sink with basic history queries.
 
@@ -89,6 +92,11 @@ class SQLiteEventStore:
 
     The store is intended for local and single-host persistence. It is not a
     distributed event store.
+
+    Cancelling a task that is awaiting emit(), history() or delete_before()
+    does not interrupt the SQLite statement already running in the worker
+    thread: the write may still be committed after the caller observes
+    asyncio.CancelledError. Connections are always closed.
     """
 
     database: str | Path
@@ -115,16 +123,7 @@ class SQLiteEventStore:
         if database_value == ":memory:":
             raise ValueError("SQLiteEventStore does not support ':memory:' databases.")
 
-        if isinstance(self.busy_timeout_seconds, bool) or not isinstance(
-            self.busy_timeout_seconds, int | float
-        ):
-            raise TypeError("busy_timeout_seconds must be an int or float.")
-
-        if not math.isfinite(float(self.busy_timeout_seconds)):
-            raise ValueError("busy_timeout_seconds must be finite.")
-
-        if self.busy_timeout_seconds < 0:
-            raise ValueError("busy_timeout_seconds must be greater than or equal to 0.")
+        check_seconds(self.busy_timeout_seconds, "busy_timeout_seconds", allow_zero=True)
 
         self._database_path = Path(database_value)
 
@@ -191,8 +190,7 @@ class SQLiteEventStore:
     ) -> int:
         """Delete events older than the supplied timestamp."""
 
-        if before.tzinfo is None:
-            raise ValueError("before must be timezone-aware.")
+        check_aware(before, "before")
 
         await self._ensure_initialized()
 
@@ -218,11 +216,15 @@ class SQLiteEventStore:
             timeout=float(self.busy_timeout_seconds),
         )
 
-        connection.row_factory = sqlite3.Row
+        try:
+            connection.row_factory = sqlite3.Row
 
-        busy_timeout_ms = int(float(self.busy_timeout_seconds) * 1000)
+            busy_timeout_ms = int(float(self.busy_timeout_seconds) * 1000)
 
-        connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+            connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+        except BaseException:
+            connection.close()
+            raise
 
         return connection
 
@@ -230,7 +232,7 @@ class SQLiteEventStore:
         connection = self._connect()
 
         try:
-            connection.execute("PRAGMA journal_mode = WAL")
+            self._enable_wal(connection)
             connection.execute("BEGIN IMMEDIATE")
 
             connection.execute(
@@ -285,6 +287,28 @@ class SQLiteEventStore:
             raise
         finally:
             connection.close()
+
+    def _enable_wal(self, connection: sqlite3.Connection) -> None:
+        # WAL mode is persistent in the database file. Switching to it needs an
+        # exclusive lock, and SQLite reports SQLITE_BUSY for that switch
+        # without consulting the busy handler, so concurrent first-time
+        # initializations retry here until the busy timeout elapses.
+        deadline = time.monotonic() + float(self.busy_timeout_seconds)
+
+        while True:
+            (journal_mode,) = connection.execute("PRAGMA journal_mode").fetchone()
+
+            if str(journal_mode).lower() == "wal":
+                return
+
+            try:
+                connection.execute("PRAGMA journal_mode = WAL")
+                return
+            except sqlite3.OperationalError as exc:
+                if exc.sqlite_errorcode not in _BUSY_ERROR_CODES or time.monotonic() >= deadline:
+                    raise
+
+            time.sleep(_WAL_RETRY_INTERVAL_SECONDS)
 
     @staticmethod
     def _read_schema_version(
@@ -417,8 +441,7 @@ class SQLiteEventStore:
 
 
 def _serialize_timestamp(timestamp: datetime) -> str:
-    if timestamp.tzinfo is None:
-        raise ValueError("timestamp must be timezone-aware.")
+    check_aware(timestamp, "timestamp")
 
     return timestamp.astimezone(UTC).isoformat(timespec="microseconds")
 

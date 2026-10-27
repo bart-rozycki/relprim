@@ -79,6 +79,14 @@ the next attempt using the following rules:
 2. Otherwise use the backoff configured by `RetryPolicy`.
 3. Do not retry when the selected delay exceeds the configured maximum wait.
 
+The maximum wait applies to the selected delay, whichever source it came
+from. A backoff delay larger than `max_rate_limit_wait` is rejected just like
+a provider hint would be. A delay equal to the maximum is accepted.
+
+A delay is only selected when another attempt is available. On the final
+attempt the failure ends the primary attempts without evaluating the maximum
+wait, so `rate_limit_wait_exceeded` stays `False`.
+
 `RetryPolicy` controls how many attempts are allowed.
 
 `RateLimitPolicy` controls which exceptions represent rate limits, how the
@@ -243,13 +251,24 @@ The final execution report includes an operation-level summary:
 `rate_limit_wait_seconds` contains the total time spent waiting because of
 rate-limit recovery during the operation.
 
+When the selected delay is rejected, `rate_limit_delay_seconds` and
+`rate_limit_delay_source` describe the rejected delay and
+`rate_limit_wait_exceeded` is `True`. They are `None` when no delay was
+selected: for failures that were not rate-limited, and on the final attempt.
+
+Each attempt counts towards `RetryPolicy.max_attempts`, whether it failed
+because of a rate limit or for another reason.
+
 ## Structured events
 
 When structured events are enabled, rate-limit handling may emit:
 
 - `rate_limit.detected`;
 - `retry.scheduled`;
-- `rate_limit.wait_exceeded`.
+- `rate_limit.wait_exceeded`, whose `delay_seconds` is the rejected delay.
+
+See [structured events and metadata](events-and-metadata.md) for every
+payload key.
 
 The `retry.scheduled` event includes:
 
@@ -265,8 +284,16 @@ The retry-after extractor must return an `int`, `float` or `None`.
 Returned numbers must be finite and greater than or equal to zero.
 
 When the extractor raises an exception or returns an invalid value, RelPrim
-raises `RetryAfterExtractionError`. The operation is not retried using an
-untrusted delay.
+records `RetryAfterExtractionError` as the attempt's failure. The original
+provider exception is available as `rate_limit_error`, and the extractor's own
+exception, if any, as `cause`. The operation is not retried using an untrusted
+delay; it continues into fallback or final failure, and the final
+`OperationExecutionError.cause` is the `RetryAfterExtractionError`.
+
+## Cancellation
+
+Cancelling the operation while it waits for a rate-limit delay propagates
+`asyncio.CancelledError` immediately. No further attempt or fallback runs.
 
 ## Scope and limitations
 

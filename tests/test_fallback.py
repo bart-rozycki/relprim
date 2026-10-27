@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from relprim import (
@@ -204,3 +206,11 @@ async def test_fallback_chain_can_be_created_from_candidates_directly() -> None:
 
     assert result.value == "ok"
     assert result.candidate_name == "primary"
+
+
+@pytest.mark.parametrize("fallback_on", [(BaseException,), (asyncio.CancelledError,)])
+def test_fallback_policy_rejects_base_exception_types(
+    fallback_on: tuple[type[BaseException], ...],
+) -> None:
+    with pytest.raises(TypeError, match="fallback_on must contain Exception subclasses"):
+        FallbackPolicy(fallback_on=fallback_on)  # type: ignore[arg-type]

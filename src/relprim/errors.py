@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from relprim.report import ExecutionReport
+
+if TYPE_CHECKING:
+    from relprim.circuit_breaker import CircuitBreakerState
 
 
 class RelPrimError(Exception):
-    """Base exception for all RelPrim errors."""
+    """Base exception for all RelPrim errors.
+
+    Configuration mistakes are reported with built-in ValueError and TypeError
+    exceptions instead, and cancellation always propagates as
+    asyncio.CancelledError.
+    """
 
 
 class RetryError(RelPrimError):
@@ -76,7 +86,7 @@ class CircuitBreakerOpenError(RelPrimError):
         message: str,
         *,
         breaker_name: str,
-        state: str,
+        state: CircuitBreakerState,
         retry_after_seconds: float | None,
     ) -> None:
         super().__init__(message)
@@ -101,10 +111,15 @@ class ValidationFailedError(RelPrimError):
 
 
 class IdempotencyReentryError(RelPrimError):
-    """Raised when an operation recursively uses the same idempotency key."""
+    """Raised when an operation recursively uses the same idempotency key.
+
+    The key is available as the `key` attribute but is intentionally not part
+    of the message, because idempotency keys may contain sensitive identifiers
+    and exception messages commonly end up in logs.
+    """
 
     def __init__(self, key: str) -> None:
-        super().__init__(f"Idempotency key '{key}' was reused recursively by its owning task.")
+        super().__init__("An idempotency key was reused recursively by its owning task.")
         self.key = key
 
 

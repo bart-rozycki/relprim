@@ -51,6 +51,14 @@ print(result.report.to_dict())
 
 The decorated function returns an `OperationResult[T]`, not a raw value. This keeps the business result and the execution report explicit.
 
+`retries=3` allows three retries after the initial attempt, `timeout=10` limits
+each attempt to ten seconds, and the fallback runs once the retries are
+exhausted. If everything fails, `OperationExecutionError` is raised with the
+execution report attached.
+
+RelPrim is fully typed: decorated functions keep their parameters, and type
+checkers see `OperationResult[str]` as the result above.
+
 ## Why RelPrim?
 
 Most external calls start simple:
@@ -122,7 +130,7 @@ Current primitives:
 * Successful result replay
 * In-memory idempotency store
 
-Future features will be driven by user feedback.
+New features are driven by user feedback.
 
 ## Validate responses with JSON Schema or Pydantic
 
@@ -171,10 +179,10 @@ Invalid responses fail with `ValidationFailedError` and a concise reason such as
 `'name' is a required property (path: $)`. Results are validated, never
 converted.
 
-See the [JSON Schema validation guide](docs/json-schema-validation.md) and the
-[Pydantic validation guide](docs/pydantic-validation.md) for details.
+See the [JSON Schema validation guide](https://github.com/bart-rozycki/relprim/blob/main/docs/json-schema-validation.md) and the
+[Pydantic validation guide](https://github.com/bart-rozycki/relprim/blob/main/docs/pydantic-validation.md) for details.
 
-## Prevent duplicate executions
+## Deduplicate repeated calls
 
 RelPrim can deduplicate repeated or concurrent calls using an idempotency key.
 
@@ -197,7 +205,9 @@ async def create_payment(
 
 The first call executes the operation. Concurrent callers join the same execution, and later calls replay the successful result.
 
-The default store is in-memory and single-process. See the [idempotency guide](docs/idempotency.md) for concurrency semantics, key design and store limitations.
+This is not an exactly-once guarantee for external side effects: if a call is cancelled or the process crashes after the side effect but before the result is cached, a later call executes again. For payments and other external mutations, also use the provider's own idempotency key.
+
+The default store is in-memory and single-process. See the [idempotency guide](https://github.com/bart-rozycki/relprim/blob/main/docs/idempotency.md) for concurrency semantics, key design and store limitations.
 
 ## Respect provider rate limits
 
@@ -236,7 +246,7 @@ RelPrim uses the provider delay when available and falls back to the normal
 retry backoff otherwise. When the selected delay exceeds
 `max_rate_limit_wait`, the operation continues into fallback or final failure.
 
-See the [rate-limit handling guide](docs/rate-limits.md) for delay selection,
+See the [rate-limit handling guide](https://github.com/bart-rozycki/relprim/blob/main/docs/rate-limits.md) for delay selection,
 report metadata, structured events and limitations.
 
 ## Persist structured event history
@@ -269,7 +279,7 @@ history = await event_store.history(
 )
 ```
 
-See the [SQLite event store guide](docs/sqlite-event-store.md) for filtering,
+See the [SQLite event store guide](https://github.com/bart-rozycki/relprim/blob/main/docs/sqlite-event-store.md) for filtering,
 pagination, retention and storage limitations.
 
 ## Export reliability events to OpenTelemetry
@@ -297,27 +307,27 @@ async def call_provider(prompt: str) -> str:
 The application remains responsible for configuring its OpenTelemetry SDK,
 tracer provider and exporter.
 
-See the [OpenTelemetry integration guide](docs/opentelemetry.md) for setup,
+See the [OpenTelemetry integration guide](https://github.com/bart-rozycki/relprim/blob/main/docs/opentelemetry.md) for setup,
 exported attributes and limitations.
 
 ## Examples
 
-Practical examples are available in the [`examples`](examples) directory:
+Practical examples are available in the [`examples`](https://github.com/bart-rozycki/relprim/tree/main/examples) directory:
 
-* [`decorator_usage.py`](examples/decorator_usage.py) — beginner-friendly decorator API
-* [`basic_resilience.py`](examples/basic_resilience.py) — retry, timeout and execution reports
-* [`fallback_chain.py`](examples/fallback_chain.py) — primary provider failure with fallback execution
-* [`circuit_breaker.py`](examples/circuit_breaker.py) — circuit breaker protection with fallback behavior
-* [`validation.py`](examples/validation.py) — result validation with retry support
-* [`json_schema_validation.py`](examples/json_schema_validation.py) — JSON Schema response validation with retry recovery
-* [`pydantic_validation.py`](examples/pydantic_validation.py) — Pydantic response validation with fallback recovery
-* [`structured_events.py`](examples/structured_events.py) — operation lifecycle events with retry and validation
-* [`idempotency.py`](examples/idempotency.py) — duplicate execution prevention and result replay
-* [`rate_limit.py`](examples/rate_limit.py) — provider retry-after handling and maximum wait enforcement
-* [`sqlite_event_store.py`](examples/sqlite_event_store.py) — durable structured events and basic history queries
-* [`opentelemetry_integration.py`](examples/opentelemetry_integration.py) — structured reliability events exported to an active OpenTelemetry span
+* [`decorator_usage.py`](https://github.com/bart-rozycki/relprim/blob/main/examples/decorator_usage.py) — beginner-friendly decorator API
+* [`basic_resilience.py`](https://github.com/bart-rozycki/relprim/blob/main/examples/basic_resilience.py) — retry, timeout and execution reports
+* [`fallback_chain.py`](https://github.com/bart-rozycki/relprim/blob/main/examples/fallback_chain.py) — primary provider failure with fallback execution
+* [`circuit_breaker.py`](https://github.com/bart-rozycki/relprim/blob/main/examples/circuit_breaker.py) — circuit breaker protection with fallback behavior
+* [`validation.py`](https://github.com/bart-rozycki/relprim/blob/main/examples/validation.py) — result validation with retry support
+* [`json_schema_validation.py`](https://github.com/bart-rozycki/relprim/blob/main/examples/json_schema_validation.py) — JSON Schema response validation with retry recovery
+* [`pydantic_validation.py`](https://github.com/bart-rozycki/relprim/blob/main/examples/pydantic_validation.py) — Pydantic response validation with fallback recovery
+* [`structured_events.py`](https://github.com/bart-rozycki/relprim/blob/main/examples/structured_events.py) — operation lifecycle events with retry and validation
+* [`idempotency.py`](https://github.com/bart-rozycki/relprim/blob/main/examples/idempotency.py) — duplicate call coordination and result replay
+* [`rate_limit.py`](https://github.com/bart-rozycki/relprim/blob/main/examples/rate_limit.py) — provider retry-after handling and maximum wait enforcement
+* [`sqlite_event_store.py`](https://github.com/bart-rozycki/relprim/blob/main/examples/sqlite_event_store.py) — durable structured events and basic history queries
+* [`opentelemetry_integration.py`](https://github.com/bart-rozycki/relprim/blob/main/examples/opentelemetry_integration.py) — structured reliability events exported to an active OpenTelemetry span
 
-If you run examples from a cloned repository, install RelPrim in editable mode first:
+Every example runs without credentials or network access. If you run examples from a cloned repository, install RelPrim in editable mode first:
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -332,14 +342,30 @@ PYTHONPATH=src python examples/decorator_usage.py
 
 ## Documentation
 
-* [Getting started](docs/getting-started.md)
-* [Advanced usage](docs/advanced-usage.md)
-* [Idempotency](docs/idempotency.md)
-* [Rate-limit handling](docs/rate-limits.md)
-* [SQLite event store](docs/sqlite-event-store.md)
-* [OpenTelemetry integration](docs/opentelemetry.md)
-* [JSON Schema validation](docs/json-schema-validation.md)
-* [Pydantic validation](docs/pydantic-validation.md)
+* [Getting started](https://github.com/bart-rozycki/relprim/blob/main/docs/getting-started.md)
+* [Advanced usage](https://github.com/bart-rozycki/relprim/blob/main/docs/advanced-usage.md)
+* [Idempotency](https://github.com/bart-rozycki/relprim/blob/main/docs/idempotency.md)
+* [Rate-limit handling](https://github.com/bart-rozycki/relprim/blob/main/docs/rate-limits.md)
+* [SQLite event store](https://github.com/bart-rozycki/relprim/blob/main/docs/sqlite-event-store.md)
+* [OpenTelemetry integration](https://github.com/bart-rozycki/relprim/blob/main/docs/opentelemetry.md)
+* [JSON Schema validation](https://github.com/bart-rozycki/relprim/blob/main/docs/json-schema-validation.md)
+* [Pydantic validation](https://github.com/bart-rozycki/relprim/blob/main/docs/pydantic-validation.md)
+
+Reference:
+
+* [API reference](https://github.com/bart-rozycki/relprim/blob/main/docs/api-reference.md)
+* [Structured events and metadata](https://github.com/bart-rozycki/relprim/blob/main/docs/events-and-metadata.md)
+* [Stability and versioning](https://github.com/bart-rozycki/relprim/blob/main/docs/stability.md)
+* [Migrating from 0.11 to 1.0](https://github.com/bart-rozycki/relprim/blob/main/docs/migration-to-1.0.md)
+
+## Stability
+
+RelPrim follows semantic versioning. The public API, documented behavior,
+event identifiers and documented metadata keys only change incompatibly in a
+new major release. Underscore-prefixed names and undocumented internals are not
+part of that promise. See [stability and versioning](https://github.com/bart-rozycki/relprim/blob/main/docs/stability.md).
+
+RelPrim supports CPython 3.11 to 3.14.
 
 ## Design principles
 

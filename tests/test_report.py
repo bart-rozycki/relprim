@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, tzinfo
 
 import pytest
 
@@ -247,3 +247,154 @@ def test_execution_report_can_be_serialized_to_dict() -> None:
     assert payload["metadata"] == {"provider": "openai"}
     assert isinstance(payload["attempts"], list)
     assert payload["last_error"] is not None
+
+
+def test_reports_reject_naive_timestamps() -> None:
+    with pytest.raises(ValueError, match="started_at must be timezone-aware"):
+        ExecutionAttempt(
+            attempt_number=1,
+            status=AttemptStatus.SUCCEEDED,
+            started_at=datetime(2026, 1, 1),
+            duration_seconds=0.1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("metadata", "error"),
+    [
+        ({"value": float("nan")}, ValueError),
+        ({"value": object()}, TypeError),
+        ({"value": [1, 2]}, TypeError),
+        ({1: "value"}, TypeError),
+    ],
+)
+def test_report_metadata_must_contain_json_scalars(
+    metadata: dict[object, object],
+    error: type[Exception],
+) -> None:
+    with pytest.raises(error):
+        ExecutionAttempt(
+            attempt_number=1,
+            status=AttemptStatus.SUCCEEDED,
+            started_at=datetime(2026, 1, 1, tzinfo=UTC),
+            duration_seconds=0.1,
+            metadata=metadata,  # type: ignore[arg-type]
+        )
+
+
+def test_report_metadata_is_copied_not_shared() -> None:
+    source: dict[str, str | int | float | bool | None] = {"key": "value"}
+    attempt = ExecutionAttempt(
+        attempt_number=1,
+        status=AttemptStatus.SUCCEEDED,
+        started_at=datetime(2026, 1, 1, tzinfo=UTC),
+        duration_seconds=0.1,
+        metadata=source,
+    )
+
+    source["key"] = "changed"
+    exported = attempt.to_dict()["metadata"]
+    assert isinstance(exported, dict)
+    exported["key"] = "mutated"
+
+    assert attempt.metadata["key"] == "value"
+
+
+def test_retry_count_does_not_count_fallback_attempts() -> None:
+    started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    failed = ExecutionError(type="TransientError", message="down")
+
+    report = ExecutionReport(
+        operation_name="provider_call",
+        status=ExecutionStatus.SUCCEEDED,
+        started_at=started_at,
+        duration_seconds=0.3,
+        attempts=(
+            ExecutionAttempt(1, AttemptStatus.FAILED, started_at, 0.1, error=failed),
+            ExecutionAttempt(2, AttemptStatus.FAILED, started_at, 0.1, error=failed),
+            ExecutionAttempt(3, AttemptStatus.SUCCEEDED, started_at, 0.1, fallback=True),
+        ),
+    )
+
+    assert report.attempt_count == 3
+    assert report.retry_count == 1
+    assert report.retried is True
+    assert report.to_dict()["retry_count"] == 1
+    assert report.attempts[-1].to_dict()["fallback"] is True
+
+
+class NoOffsetTimezone(tzinfo):
+    """A tzinfo that makes datetimes naive: utcoffset() returns None."""
+
+    def utcoffset(self, dt: datetime | None) -> None:
+        return None
+
+    def dst(self, dt: datetime | None) -> None:
+        return None
+
+    def tzname(self, dt: datetime | None) -> str:
+        return "unknown"
+
+
+def test_reports_reject_timestamps_without_utc_offset() -> None:
+    started_at = datetime(2026, 1, 1, tzinfo=NoOffsetTimezone())
+
+    with pytest.raises(ValueError, match="started_at must be timezone-aware"):
+        ExecutionAttempt(1, AttemptStatus.SUCCEEDED, started_at, 0.1)
+
+    with pytest.raises(ValueError, match="started_at must be timezone-aware"):
+        ExecutionReport(
+            operation_name="provider_call",
+            status=ExecutionStatus.SUCCEEDED,
+            started_at=started_at,
+            duration_seconds=0.1,
+            attempts=(successful_attempt(),),
+        )
+
+
+@pytest.mark.parametrize("duration", [float("nan"), float("inf"), float("-inf")])
+def test_execution_attempt_rejects_non_finite_duration(duration: float) -> None:
+    with pytest.raises(ValueError, match="duration_seconds must be finite"):
+        ExecutionAttempt(1, AttemptStatus.SUCCEEDED, utc_now(), duration)
+
+
+@pytest.mark.parametrize("duration", [float("nan"), float("inf"), float("-inf")])
+def test_execution_report_rejects_non_finite_duration(duration: float) -> None:
+    with pytest.raises(ValueError, match="duration_seconds must be finite"):
+        ExecutionReport(
+            operation_name="provider_call",
+            status=ExecutionStatus.SUCCEEDED,
+            started_at=utc_now(),
+            duration_seconds=duration,
+            attempts=(successful_attempt(),),
+        )
+
+
+@pytest.mark.parametrize("duration", [True, "0.1", None])
+def test_report_durations_must_be_numbers(duration: object) -> None:
+    with pytest.raises(TypeError, match="duration_seconds must be an int or float"):
+        ExecutionAttempt(1, AttemptStatus.SUCCEEDED, utc_now(), duration)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="duration_seconds must be an int or float"):
+        ExecutionReport(
+            operation_name="provider_call",
+            status=ExecutionStatus.SUCCEEDED,
+            started_at=utc_now(),
+            duration_seconds=duration,  # type: ignore[arg-type]
+            attempts=(successful_attempt(),),
+        )
+
+
+@pytest.mark.parametrize("duration", [0, 0.0, 1, 2.5])
+def test_report_durations_accept_finite_non_negative_numbers(duration: float) -> None:
+    attempt = ExecutionAttempt(1, AttemptStatus.SUCCEEDED, utc_now(), duration)
+    report = ExecutionReport(
+        operation_name="provider_call",
+        status=ExecutionStatus.SUCCEEDED,
+        started_at=utc_now(),
+        duration_seconds=duration,
+        attempts=(attempt,),
+    )
+
+    assert attempt.duration_seconds == duration
+    assert report.duration_seconds == duration

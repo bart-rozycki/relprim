@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Generic, ParamSpec, TypeAlias, TypeVar
 
+from relprim._checks import JsonScalar
 from relprim.circuit_breaker import CircuitBreaker
 from relprim.errors import (
     CircuitBreakerOpenError,
@@ -17,7 +18,7 @@ from relprim.errors import (
     ValidationFailedError,
 )
 from relprim.events import EventEmitter, EventType
-from relprim.fallback import FallbackChain, FallbackResult
+from relprim.fallback import FallbackCandidate, FallbackChain, FallbackResult
 from relprim.idempotency import IdempotencyPolicy, IdempotencyResult
 from relprim.rate_limit import RateLimitDecision, RateLimitPolicy
 from relprim.report import (
@@ -30,12 +31,12 @@ from relprim.report import (
 from relprim.result import OperationResult
 from relprim.retry import RetryPolicy
 from relprim.timeout import TimeoutPolicy
-from relprim.validation import ValidationPolicy, ValidationResult
+from relprim.validation import ValidationPolicy, ValidationResult, _validation_error
 
 P = ParamSpec("P")
 R = TypeVar("R")
 
-MetadataValue: TypeAlias = str | int | float | bool | None
+MetadataValue: TypeAlias = JsonScalar
 Metadata: TypeAlias = Mapping[str, MetadataValue]
 MutableMetadata: TypeAlias = dict[str, MetadataValue]
 
@@ -47,6 +48,14 @@ class _RetryDelaySource(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class _RetryPlan:
+    """Retry decision for one failed primary attempt.
+
+    `retryable` classifies the failure under the configured policies.
+    `delay_seconds` is the delay selected before the next attempt. It is only
+    computed when another attempt is available, and for rejected rate-limit
+    waits it holds the delay that exceeded the maximum wait.
+    """
+
     retryable: bool
     rate_limited: bool = False
     retry_after_seconds: float | None = None
@@ -55,14 +64,18 @@ class _RetryPlan:
     max_wait_exceeded: bool = False
 
     def __post_init__(self) -> None:
-        if self.retryable:
-            if self.delay_seconds is None or self.delay_source is None:
-                raise ValueError("retryable plans must include delay information.")
-        elif self.delay_seconds is not None or self.delay_source is not None:
+        if (self.delay_seconds is None) != (self.delay_source is None):
+            raise ValueError("delay_seconds and delay_source must be set together.")
+
+        if self.max_wait_exceeded:
+            if not self.rate_limited or self.retryable or self.delay_seconds is None:
+                raise ValueError("max_wait_exceeded requires a rejected rate-limit delay.")
+        elif not self.retryable and self.delay_seconds is not None:
             raise ValueError("non-retryable plans must not include a retry delay.")
 
-        if self.max_wait_exceeded and not self.rate_limited:
-            raise ValueError("max_wait_exceeded requires a rate-limited plan.")
+    @property
+    def will_retry(self) -> bool:
+        return self.retryable and self.delay_seconds is not None
 
 
 def _utc_now() -> datetime:
@@ -84,6 +97,11 @@ class AsyncOperation(Generic[P, R]):
 
     This class intentionally does not know anything about AI providers, HTTP,
     payments, queues or storage. It operates on any async callable.
+
+    Create instances with async_operation(). The dataclass constructor and the
+    underscore-prefixed fields are implementation details. Builder methods
+    return new instances; calling the same builder method again replaces the
+    previously configured policy.
     """
 
     name: str
@@ -204,6 +222,7 @@ class AsyncOperation(Generic[P, R]):
                     retry_plan = self._retry_plan_for_exception(
                         exc,
                         attempt_number=attempt_number,
+                        attempts_remaining=attempt_number < max_attempts,
                     )
                 except RetryAfterExtractionError as extraction_error:
                     exc = extraction_error
@@ -270,7 +289,7 @@ class AsyncOperation(Generic[P, R]):
                         payload={
                             "attempt_number": attempt_number,
                             "breaker_name": exc.breaker_name,
-                            "state": exc.state,
+                            "state": exc.state.value,
                             "retry_after_seconds": exc.retry_after_seconds,
                         },
                     )
@@ -297,9 +316,7 @@ class AsyncOperation(Generic[P, R]):
                     },
                 )
 
-                final_primary_failure = (not retryable) or attempt_number >= max_attempts
-
-                if not final_primary_failure:
+                if retry_plan.will_retry:
                     delay_seconds = await self._sleep_before_retry(
                         attempt_number,
                         retry_plan=retry_plan,
@@ -310,7 +327,10 @@ class AsyncOperation(Generic[P, R]):
 
                     continue
 
-                if self._fallback_chain is not None:
+                if self._fallback_chain is not None and self._fallback_chain.policy.should_fallback(
+                    exc
+                ):
+                    fallback_chain = self._fallback_chain
                     fallback_attempt_number = len(attempts) + 1
                     fallback_started_at = _utc_now()
                     fallback_started_monotonic = time.perf_counter()
@@ -324,13 +344,20 @@ class AsyncOperation(Generic[P, R]):
                     )
 
                     try:
-                        fallback_result = await self._fallback_chain.run(*args, **kwargs)
-                        fallback_validation_metadata = self._validate_value(fallback_result.value)
+                        fallback_result = await self._validated_fallback_chain(fallback_chain).run(
+                            *args, **kwargs
+                        )
                     except Exception as fallback_exc:
                         fallback_duration = _elapsed_seconds(fallback_started_monotonic)
                         fallback_metadata = self._fallback_failure_metadata(fallback_exc)
 
-                        if isinstance(fallback_exc, ValidationFailedError):
+                        if isinstance(fallback_exc, FallbackChainError):
+                            await self._emit_fallback_validation_failures(
+                                fallback_chain,
+                                fallback_exc.failures,
+                                attempt_number=fallback_attempt_number,
+                            )
+                        elif isinstance(fallback_exc, ValidationFailedError):
                             await self._emit_event(
                                 EventType.VALIDATION_FAILED,
                                 payload={
@@ -338,6 +365,7 @@ class AsyncOperation(Generic[P, R]):
                                     "validator_name": fallback_exc.validator_name,
                                     "reason": fallback_exc.reason,
                                     "fallback_used": True,
+                                    "fallback_candidate_name": None,
                                 },
                             )
 
@@ -352,6 +380,7 @@ class AsyncOperation(Generic[P, R]):
                                     retryable=False,
                                 ),
                                 metadata=fallback_metadata,
+                                fallback=True,
                             )
                         )
 
@@ -412,6 +441,14 @@ class AsyncOperation(Generic[P, R]):
                             cause=fallback_exc,
                         ) from fallback_exc
 
+                    fallback_value, fallback_validation_metadata = fallback_result.value
+
+                    await self._emit_fallback_validation_failures(
+                        fallback_chain,
+                        fallback_result.failures,
+                        attempt_number=fallback_attempt_number,
+                    )
+
                     if fallback_validation_metadata["validation_performed"] is True:
                         await self._emit_event(
                             EventType.VALIDATION_SUCCEEDED,
@@ -421,6 +458,7 @@ class AsyncOperation(Generic[P, R]):
                                     "validation_validator_name"
                                 ],
                                 "fallback_used": True,
+                                "fallback_candidate_name": fallback_result.candidate_name,
                             },
                         )
 
@@ -437,6 +475,7 @@ class AsyncOperation(Generic[P, R]):
                             started_at=fallback_started_at,
                             duration_seconds=fallback_duration,
                             metadata=fallback_metadata,
+                            fallback=True,
                         )
                     )
 
@@ -488,7 +527,7 @@ class AsyncOperation(Generic[P, R]):
                     )
 
                     return OperationResult(
-                        value=fallback_result.value,
+                        value=fallback_value,
                         report=report,
                     )
 
@@ -626,16 +665,63 @@ class AsyncOperation(Generic[P, R]):
 
         result = self._validation_policy.validate(value)
 
-        if result.valid:
-            return self._validation_success_metadata(result)
+        if not result.valid:
+            raise _validation_error(result)
 
-        reason = result.reason or "Validation failed."
+        return self._validation_success_metadata(result)
 
-        raise ValidationFailedError(
-            f"Validation failed in '{result.validator_name}': {reason}",
-            validator_name=result.validator_name,
-            reason=reason,
+    def _validated_fallback_chain(
+        self,
+        chain: FallbackChain[P, R],
+    ) -> FallbackChain[P, tuple[R, MutableMetadata]]:
+        """Return a chain whose candidates validate their own results.
+
+        An invalid candidate result raises ValidationFailedError inside the
+        chain, so the chain's FallbackPolicy decides whether the next candidate
+        is tried, exactly like any other candidate failure.
+        """
+
+        def validated(
+            operation: Callable[P, Awaitable[R]],
+        ) -> Callable[P, Awaitable[tuple[R, MutableMetadata]]]:
+            async def run_candidate(
+                *args: P.args,
+                **kwargs: P.kwargs,
+            ) -> tuple[R, MutableMetadata]:
+                value = await operation(*args, **kwargs)
+                return value, self._validate_value(value)
+
+            return run_candidate
+
+        return FallbackChain(
+            candidates=tuple(
+                FallbackCandidate(name=candidate.name, operation=validated(candidate.operation))
+                for candidate in chain.candidates
+            ),
+            policy=chain.policy,
         )
+
+    async def _emit_fallback_validation_failures(
+        self,
+        chain: FallbackChain[P, R],
+        failures: tuple[BaseException, ...],
+        *,
+        attempt_number: int,
+    ) -> None:
+        # FallbackChain records failures in candidate order and stops at the
+        # first non-fallbackable failure, so failures[i] belongs to candidate i.
+        for candidate, failure in zip(chain.candidates, failures, strict=False):
+            if isinstance(failure, ValidationFailedError):
+                await self._emit_event(
+                    EventType.VALIDATION_FAILED,
+                    payload={
+                        "attempt_number": attempt_number,
+                        "validator_name": failure.validator_name,
+                        "reason": failure.reason,
+                        "fallback_used": True,
+                        "fallback_candidate_name": candidate.name,
+                    },
+                )
 
     async def _sleep_before_retry(
         self,
@@ -646,7 +732,7 @@ class AsyncOperation(Generic[P, R]):
         if self._retry_policy is None:
             raise RuntimeError("Retry sleep requested without retry policy.")
 
-        if not retry_plan.retryable or retry_plan.delay_seconds is None:
+        if not retry_plan.will_retry or retry_plan.delay_seconds is None:
             raise RuntimeError("Retry sleep requested without a retryable plan.")
 
         await self._emit_event(
@@ -693,9 +779,6 @@ class AsyncOperation(Generic[P, R]):
     def _report_status_for_attempt_status(status: AttemptStatus) -> ExecutionStatus:
         if status is AttemptStatus.TIMED_OUT:
             return ExecutionStatus.TIMED_OUT
-
-        if status is AttemptStatus.CANCELLED:
-            return ExecutionStatus.CANCELLED
 
         return ExecutionStatus.FAILED
 
@@ -758,15 +841,21 @@ class AsyncOperation(Generic[P, R]):
         if isinstance(exception, ValidationFailedError):
             metadata.update(self._validation_failure_metadata(exception))
 
+        rate_limit_delay_source = (
+            retry_plan.delay_source.value
+            if retry_plan.rate_limited and retry_plan.delay_source is not None
+            else None
+        )
+
         metadata.update(
             {
                 "rate_limited": retry_plan.rate_limited,
-                "rate_limit_retry_after_seconds": (retry_plan.retry_after_seconds),
-                "rate_limit_delay_seconds": retry_plan.delay_seconds,
-                "rate_limit_delay_source": (
-                    retry_plan.delay_source.value if retry_plan.delay_source is not None else None
+                "rate_limit_retry_after_seconds": retry_plan.retry_after_seconds,
+                "rate_limit_delay_seconds": (
+                    retry_plan.delay_seconds if retry_plan.rate_limited else None
                 ),
-                "rate_limit_wait_exceeded": (retry_plan.max_wait_exceeded),
+                "rate_limit_delay_source": rate_limit_delay_source,
+                "rate_limit_wait_exceeded": retry_plan.max_wait_exceeded,
             }
         )
 
@@ -774,7 +863,7 @@ class AsyncOperation(Generic[P, R]):
 
     @staticmethod
     def _fallback_success_metadata(
-        result: FallbackResult[R],
+        result: FallbackResult[object],
         *,
         validation_metadata: Metadata,
     ) -> MutableMetadata:
@@ -791,7 +880,12 @@ class AsyncOperation(Generic[P, R]):
         return metadata
 
     def _fallback_failure_metadata(self, exception: Exception) -> MutableMetadata:
-        failure_count = len(exception.failures) if isinstance(exception, FallbackChainError) else 0
+        if isinstance(exception, FallbackChainError):
+            failure_count = len(exception.failures)
+            final_failure = exception.cause
+        else:
+            failure_count = 0
+            final_failure = exception
 
         metadata: MutableMetadata = {
             "fallback_used": True,
@@ -800,8 +894,8 @@ class AsyncOperation(Generic[P, R]):
             "circuit_breaker_open": isinstance(exception, CircuitBreakerOpenError),
         }
 
-        if isinstance(exception, ValidationFailedError):
-            metadata.update(self._validation_failure_metadata(exception))
+        if isinstance(final_failure, ValidationFailedError):
+            metadata.update(self._validation_failure_metadata(final_failure))
         else:
             metadata.update(self._no_validation_metadata())
 
@@ -815,10 +909,11 @@ class AsyncOperation(Generic[P, R]):
         original_report = operation_result.report
 
         metadata: MutableMetadata = dict(original_report.metadata)
+        # The raw key is deliberately not copied into report metadata: keys may
+        # contain sensitive identifiers and reports are meant to be exported.
         metadata.update(
             {
                 "idempotency_enabled": True,
-                "idempotency_key": idempotency_result.key,
                 "idempotency_status": idempotency_result.status.value,
                 "idempotency_cache_hit": idempotency_result.cache_hit,
             }
@@ -843,6 +938,7 @@ class AsyncOperation(Generic[P, R]):
         exception: Exception,
         *,
         attempt_number: int,
+        attempts_remaining: bool,
     ) -> _RetryPlan:
         rate_limit_decision = self._rate_limit_decision(exception)
 
@@ -850,6 +946,7 @@ class AsyncOperation(Generic[P, R]):
             return self._rate_limit_retry_plan(
                 rate_limit_decision,
                 attempt_number=attempt_number,
+                attempts_remaining=attempts_remaining,
             )
 
         if self._retry_policy is None:
@@ -857,6 +954,9 @@ class AsyncOperation(Generic[P, R]):
 
         if not isinstance(exception, self._retry_policy.retry_on):
             return _RetryPlan(retryable=False)
+
+        if not attempts_remaining:
+            return _RetryPlan(retryable=True)
 
         delay_seconds = self._retry_policy.backoff.delay_for_retry(attempt_number)
 
@@ -880,6 +980,7 @@ class AsyncOperation(Generic[P, R]):
         decision: RateLimitDecision,
         *,
         attempt_number: int,
+        attempts_remaining: bool,
     ) -> _RetryPlan:
         if self._rate_limit_policy is None:
             raise RuntimeError("Rate-limit decision created without a rate-limit policy.")
@@ -887,6 +988,15 @@ class AsyncOperation(Generic[P, R]):
         if self._retry_policy is None:
             return _RetryPlan(
                 retryable=False,
+                rate_limited=True,
+                retry_after_seconds=decision.retry_after_seconds,
+            )
+
+        if not attempts_remaining:
+            # No further attempt exists, so no delay is selected and the
+            # maximum wait is not evaluated.
+            return _RetryPlan(
+                retryable=True,
                 rate_limited=True,
                 retry_after_seconds=decision.retry_after_seconds,
             )
@@ -903,6 +1013,8 @@ class AsyncOperation(Generic[P, R]):
                 retryable=False,
                 rate_limited=True,
                 retry_after_seconds=decision.retry_after_seconds,
+                delay_seconds=delay_seconds,
+                delay_source=delay_source,
                 max_wait_exceeded=True,
             )
 

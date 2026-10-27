@@ -5,21 +5,24 @@ from typing import Generic, TypeVar
 
 from relprim.report import ExecutionReport
 
-T = TypeVar("T")
+T_co = TypeVar("T_co", covariant=True)
 
 
 @dataclass(frozen=True, slots=True)
-class OperationResult(Generic[T]):
+class OperationResult(Generic[T_co]):
     """Result of a resilient operation execution.
 
     OperationResult keeps the business value and execution report together.
 
-    Low-level primitives such as RetryPolicy and TimeoutPolicy may still return
-    raw values directly. Higher-level APIs can return OperationResult when users
-    need observability data alongside the actual result.
+    OperationResult is only returned for successful executions; failed
+    executions raise OperationExecutionError with the report attached. The
+    `succeeded` and `failed` properties mirror the report for convenience.
+
+    Low-level primitives such as RetryPolicy and TimeoutPolicy return raw values
+    directly.
     """
 
-    value: T
+    value: T_co
     report: ExecutionReport
 
     @property
