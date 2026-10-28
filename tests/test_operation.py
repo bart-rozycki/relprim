@@ -12,6 +12,7 @@ from relprim import (
     EventType,
     ExecutionStatus,
     ExponentialBackoff,
+    FallbackChainError,
     IdempotencyStatus,
     InMemoryEventSink,
     InMemoryIdempotencyStore,
@@ -618,7 +619,7 @@ async def test_async_operation_validates_successful_result() -> None:
     assert result.report.status is ExecutionStatus.SUCCEEDED
     assert result.report.metadata["validation_performed"] is True
     assert result.report.metadata["validation_valid"] is True
-    assert result.report.metadata["validation_validator_name"] == "validation_policy"
+    assert result.report.metadata["validation_validator_name"] == "non_empty"
     assert result.report.metadata["validation_reason"] is None
     assert result.report.last_attempt.metadata["validation_valid"] is True
 
@@ -774,7 +775,11 @@ async def test_async_operation_raises_when_fallback_result_fails_validation() ->
 
     error = exc_info.value
 
-    assert isinstance(error.cause, ValidationFailedError)
+    # An invalid candidate result is a candidate failure like any other: the
+    # chain reports it through FallbackChainError.
+    assert isinstance(error.cause, FallbackChainError)
+    assert len(error.cause.failures) == 1
+    assert isinstance(error.cause.failures[0], ValidationFailedError)
     assert error.report.status is ExecutionStatus.FAILED
     assert error.report.attempt_count == 2
     assert error.report.metadata["fallback_used"] is True
@@ -1001,7 +1006,7 @@ async def test_async_operation_emits_events_for_validation_success() -> None:
         EventType.ATTEMPT_SUCCEEDED,
         EventType.OPERATION_SUCCEEDED,
     ]
-    assert events[2].payload["validator_name"] == "validation_policy"
+    assert events[2].payload["validator_name"] == "non_empty"
     assert events[3].payload["validation_valid"] is True
 
 
@@ -1028,223 +1033,227 @@ async def test_async_operation_builder_preserves_event_emitter_across_policy_cha
     assert events[0].event_type is EventType.OPERATION_STARTED
     assert events[-1].event_type is EventType.OPERATION_SUCCEEDED
 
-    async def test_async_operation_replays_result_for_same_idempotency_key() -> None:
-        store = InMemoryIdempotencyStore()
-        calls = 0
 
-        async def operation(request_id: str) -> str:
-            nonlocal calls
-            calls += 1
-            return f"response:{request_id}"
+async def test_async_operation_replays_result_for_same_idempotency_key() -> None:
+    store = InMemoryIdempotencyStore()
+    calls = 0
 
-        configured_operation = async_operation(
-            "provider_call",
-            operation,
-        ).with_idempotency(
+    async def operation(request_id: str) -> str:
+        nonlocal calls
+        calls += 1
+        return f"response:{request_id}"
+
+    configured_operation = async_operation(
+        "provider_call",
+        operation,
+    ).with_idempotency(
+        idempotency_policy(
+            lambda request_id: request_id,
+            store=store,
+            ttl_seconds=60,
+        )
+    )
+
+    first = await configured_operation.run("request-123")
+    second = await configured_operation.run("request-123")
+
+    assert first.value == "response:request-123"
+    assert second.value == "response:request-123"
+    assert calls == 1
+
+    assert first.report.metadata["idempotency_enabled"] is True
+    assert "idempotency_key" not in first.report.metadata
+    assert first.report.metadata["idempotency_status"] == IdempotencyStatus.EXECUTED.value
+    assert first.report.metadata["idempotency_cache_hit"] is False
+
+    assert second.report.metadata["idempotency_status"] == IdempotencyStatus.REPLAYED.value
+    assert second.report.metadata["idempotency_cache_hit"] is True
+
+
+async def test_async_operation_joins_concurrent_idempotent_execution() -> None:
+    store = InMemoryIdempotencyStore()
+    operation_started = asyncio.Event()
+    release_operation = asyncio.Event()
+    calls = 0
+
+    async def operation(request_id: str) -> str:
+        nonlocal calls
+        calls += 1
+        operation_started.set()
+        await release_operation.wait()
+        return f"response:{request_id}"
+
+    configured_operation = async_operation(
+        "provider_call",
+        operation,
+    ).with_idempotency(
+        idempotency_policy(
+            lambda request_id: request_id,
+            store=store,
+            ttl_seconds=60,
+        )
+    )
+
+    owner_task = asyncio.create_task(configured_operation.run("request-123"))
+
+    await operation_started.wait()
+
+    waiter_task = asyncio.create_task(configured_operation.run("request-123"))
+
+    await asyncio.sleep(0)
+    release_operation.set()
+
+    owner_result, waiter_result = await asyncio.gather(
+        owner_task,
+        waiter_task,
+    )
+
+    assert calls == 1
+    assert owner_result.value == "response:request-123"
+    assert waiter_result.value == "response:request-123"
+
+    assert owner_result.report.metadata["idempotency_status"] == IdempotencyStatus.EXECUTED.value
+    assert waiter_result.report.metadata["idempotency_status"] == IdempotencyStatus.JOINED.value
+    assert waiter_result.report.metadata["idempotency_cache_hit"] is True
+
+
+async def test_async_operation_executes_separately_for_different_keys() -> None:
+    store = InMemoryIdempotencyStore()
+    calls = 0
+
+    async def operation(request_id: str) -> str:
+        nonlocal calls
+        calls += 1
+        return f"response:{request_id}"
+
+    configured_operation = async_operation(
+        "provider_call",
+        operation,
+    ).with_idempotency(
+        idempotency_policy(
+            lambda request_id: request_id,
+            store=store,
+            ttl_seconds=60,
+        )
+    )
+
+    first = await configured_operation.run("request-123")
+    second = await configured_operation.run("request-456")
+
+    assert first.value == "response:request-123"
+    assert second.value == "response:request-456"
+    assert calls == 2
+    assert first.report.metadata["idempotency_status"] == "executed"
+    assert second.report.metadata["idempotency_status"] == "executed"
+
+
+async def test_async_operation_idempotency_wraps_entire_retry_flow() -> None:
+    store = InMemoryIdempotencyStore()
+    calls = 0
+
+    async def operation(request_id: str) -> str:
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            raise TransientError("temporary failure")
+
+        return f"response:{request_id}"
+
+    configured_operation = (
+        async_operation("provider_call", operation)
+        .with_retry(
+            retry_policy(
+                max_attempts=2,
+                retry_on=(TransientError,),
+            )
+        )
+        .with_idempotency(
             idempotency_policy(
                 lambda request_id: request_id,
                 store=store,
                 ttl_seconds=60,
             )
         )
+    )
 
-        first = await configured_operation.run("request-123")
-        second = await configured_operation.run("request-123")
+    first = await configured_operation.run("request-123")
+    second = await configured_operation.run("request-123")
 
-        assert first.value == "response:request-123"
-        assert second.value == "response:request-123"
-        assert calls == 1
+    assert calls == 2
 
-        assert first.report.metadata["idempotency_enabled"] is True
-        assert first.report.metadata["idempotency_key"] == "request-123"
-        assert first.report.metadata["idempotency_status"] == IdempotencyStatus.EXECUTED.value
-        assert first.report.metadata["idempotency_cache_hit"] is False
+    assert first.report.attempt_count == 2
+    assert first.report.retry_count == 1
+    assert first.report.metadata["idempotency_status"] == "executed"
 
-        assert second.report.metadata["idempotency_status"] == IdempotencyStatus.REPLAYED.value
-        assert second.report.metadata["idempotency_cache_hit"] is True
+    assert second.report.attempt_count == 2
+    assert second.report.retry_count == 1
+    assert second.report.metadata["idempotency_status"] == "replayed"
 
-    async def test_async_operation_joins_concurrent_idempotent_execution() -> None:
-        store = InMemoryIdempotencyStore()
-        operation_started = asyncio.Event()
-        release_operation = asyncio.Event()
-        calls = 0
 
-        async def operation(request_id: str) -> str:
-            nonlocal calls
-            calls += 1
-            operation_started.set()
-            await release_operation.wait()
-            return f"response:{request_id}"
+async def test_async_operation_does_not_cache_failed_execution() -> None:
+    store = InMemoryIdempotencyStore()
+    calls = 0
 
-        configured_operation = async_operation(
-            "provider_call",
-            operation,
-        ).with_idempotency(
+    async def operation(request_id: str) -> str:
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            raise PermanentError("provider unavailable")
+
+        return f"response:{request_id}"
+
+    configured_operation = async_operation(
+        "provider_call",
+        operation,
+    ).with_idempotency(
+        idempotency_policy(
+            lambda request_id: request_id,
+            store=store,
+            ttl_seconds=60,
+        )
+    )
+
+    with pytest.raises(OperationExecutionError):
+        await configured_operation.run("request-123")
+
+    result = await configured_operation.run("request-123")
+
+    assert result.value == "response:request-123"
+    assert result.report.metadata["idempotency_status"] == "executed"
+    assert calls == 2
+
+
+async def test_async_operation_builder_preserves_idempotency_policy() -> None:
+    store = InMemoryIdempotencyStore()
+    calls = 0
+
+    async def operation(request_id: str) -> str:
+        nonlocal calls
+        calls += 1
+        return f"response:{request_id}"
+
+    configured_operation = (
+        async_operation("provider_call", operation)
+        .with_idempotency(
             idempotency_policy(
                 lambda request_id: request_id,
                 store=store,
                 ttl_seconds=60,
             )
         )
+        .with_retry(retry_policy(max_attempts=2))
+        .with_timeout(TimeoutPolicy(seconds=1))
+    )
 
-        owner_task = asyncio.create_task(configured_operation.run("request-123"))
+    first = await configured_operation.run("request-123")
+    second = await configured_operation.run("request-123")
 
-        await operation_started.wait()
-
-        waiter_task = asyncio.create_task(configured_operation.run("request-123"))
-
-        await asyncio.sleep(0)
-        release_operation.set()
-
-        owner_result, waiter_result = await asyncio.gather(
-            owner_task,
-            waiter_task,
-        )
-
-        assert calls == 1
-        assert owner_result.value == "response:request-123"
-        assert waiter_result.value == "response:request-123"
-
-        assert (
-            owner_result.report.metadata["idempotency_status"] == IdempotencyStatus.EXECUTED.value
-        )
-        assert waiter_result.report.metadata["idempotency_status"] == IdempotencyStatus.JOINED.value
-        assert waiter_result.report.metadata["idempotency_cache_hit"] is True
-
-    async def test_async_operation_executes_separately_for_different_keys() -> None:
-        store = InMemoryIdempotencyStore()
-        calls = 0
-
-        async def operation(request_id: str) -> str:
-            nonlocal calls
-            calls += 1
-            return f"response:{request_id}"
-
-        configured_operation = async_operation(
-            "provider_call",
-            operation,
-        ).with_idempotency(
-            idempotency_policy(
-                lambda request_id: request_id,
-                store=store,
-                ttl_seconds=60,
-            )
-        )
-
-        first = await configured_operation.run("request-123")
-        second = await configured_operation.run("request-456")
-
-        assert first.value == "response:request-123"
-        assert second.value == "response:request-456"
-        assert calls == 2
-        assert first.report.metadata["idempotency_status"] == "executed"
-        assert second.report.metadata["idempotency_status"] == "executed"
-
-    async def test_async_operation_idempotency_wraps_entire_retry_flow() -> None:
-        store = InMemoryIdempotencyStore()
-        calls = 0
-
-        async def operation(request_id: str) -> str:
-            nonlocal calls
-            calls += 1
-
-            if calls == 1:
-                raise TransientError("temporary failure")
-
-            return f"response:{request_id}"
-
-        configured_operation = (
-            async_operation("provider_call", operation)
-            .with_retry(
-                retry_policy(
-                    max_attempts=2,
-                    retry_on=(TransientError,),
-                )
-            )
-            .with_idempotency(
-                idempotency_policy(
-                    lambda request_id: request_id,
-                    store=store,
-                    ttl_seconds=60,
-                )
-            )
-        )
-
-        first = await configured_operation.run("request-123")
-        second = await configured_operation.run("request-123")
-
-        assert calls == 2
-
-        assert first.report.attempt_count == 2
-        assert first.report.retry_count == 1
-        assert first.report.metadata["idempotency_status"] == "executed"
-
-        assert second.report.attempt_count == 2
-        assert second.report.retry_count == 1
-        assert second.report.metadata["idempotency_status"] == "replayed"
-
-    async def test_async_operation_does_not_cache_failed_execution() -> None:
-        store = InMemoryIdempotencyStore()
-        calls = 0
-
-        async def operation(request_id: str) -> str:
-            nonlocal calls
-            calls += 1
-
-            if calls == 1:
-                raise PermanentError("provider unavailable")
-
-            return f"response:{request_id}"
-
-        configured_operation = async_operation(
-            "provider_call",
-            operation,
-        ).with_idempotency(
-            idempotency_policy(
-                lambda request_id: request_id,
-                store=store,
-                ttl_seconds=60,
-            )
-        )
-
-        with pytest.raises(OperationExecutionError):
-            await configured_operation.run("request-123")
-
-        result = await configured_operation.run("request-123")
-
-        assert result.value == "response:request-123"
-        assert result.report.metadata["idempotency_status"] == "executed"
-        assert calls == 2
-
-    async def test_async_operation_builder_preserves_idempotency_policy() -> None:
-        store = InMemoryIdempotencyStore()
-        calls = 0
-
-        async def operation(request_id: str) -> str:
-            nonlocal calls
-            calls += 1
-            return f"response:{request_id}"
-
-        configured_operation = (
-            async_operation("provider_call", operation)
-            .with_idempotency(
-                idempotency_policy(
-                    lambda request_id: request_id,
-                    store=store,
-                    ttl_seconds=60,
-                )
-            )
-            .with_retry(retry_policy(max_attempts=2))
-            .with_timeout(TimeoutPolicy(seconds=1))
-        )
-
-        first = await configured_operation.run("request-123")
-        second = await configured_operation.run("request-123")
-
-        assert first.value == "response:request-123"
-        assert second.value == "response:request-123"
-        assert calls == 1
-        assert second.report.metadata["idempotency_status"] == "replayed"
+    assert first.value == "response:request-123"
+    assert second.value == "response:request-123"
+    assert calls == 1
+    assert second.report.metadata["idempotency_status"] == "replayed"
 
 
 async def test_async_operation_uses_provider_retry_after_delay() -> None:

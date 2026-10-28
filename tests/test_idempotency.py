@@ -431,3 +431,50 @@ async def test_purge_expired_removes_only_expired_entries() -> None:
 
     assert removed == 1
     assert await store.entry_count() == 1
+
+
+@pytest.mark.parametrize("ttl_seconds", [float("nan"), float("inf")])
+def test_idempotency_policy_rejects_non_finite_ttl(ttl_seconds: float) -> None:
+    with pytest.raises(ValueError, match="ttl_seconds must be finite"):
+        idempotency_policy(lambda: "key", ttl_seconds=ttl_seconds)
+
+
+async def test_store_rejects_non_finite_ttl_per_call() -> None:
+    store = InMemoryIdempotencyStore()
+
+    async def operation() -> str:
+        return "created"
+
+    with pytest.raises(ValueError, match="ttl_seconds must be finite"):
+        await store.execute("key", operation, ttl_seconds=float("nan"))
+
+    assert await store.entry_count() == 0
+
+
+async def test_entry_expires_exactly_at_ttl_boundary() -> None:
+    clock = ManualClock()
+    store = InMemoryIdempotencyStore(clock=clock)
+    calls = 0
+
+    async def operation() -> int:
+        nonlocal calls
+        calls += 1
+        return calls
+
+    await store.execute("key", operation, ttl_seconds=10)
+
+    clock.advance(9.999)
+    assert (await store.execute("key", operation, ttl_seconds=10)).replayed
+
+    clock.advance(0.001)
+    result = await store.execute("key", operation, ttl_seconds=10)
+
+    assert result.executed
+    assert result.value == 2
+
+
+def test_reentry_error_message_does_not_contain_the_key() -> None:
+    error = IdempotencyReentryError("customer@example.com:refund")
+
+    assert "customer@example.com" not in str(error)
+    assert error.key == "customer@example.com:refund"

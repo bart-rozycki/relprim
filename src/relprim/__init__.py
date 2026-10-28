@@ -3,7 +3,7 @@ from relprim.circuit_breaker import (
     CircuitBreakerSnapshot,
     CircuitBreakerState,
 )
-from relprim.decorators import resilient
+from relprim.decorators import ResilientDecorator, resilient
 from relprim.errors import (
     CircuitBreakerOpenError,
     FallbackChainError,
@@ -54,7 +54,7 @@ from relprim.report import (
     ExecutionStatus,
 )
 from relprim.result import OperationResult
-from relprim.retry import ExponentialBackoff, RetryAttempt, RetryPolicy
+from relprim.retry import ExponentialBackoff, RetryPolicy
 from relprim.sqlite_events import (
     SQLiteEventStore,
     StoredEvent,
@@ -104,9 +104,9 @@ __all__ = [
     "RateLimitDecision",
     "RateLimitPolicy",
     "RelPrimError",
+    "ResilientDecorator",
     "RetryAfterExtractionError",
     "RetryAfterExtractor",
-    "RetryAttempt",
     "RetryError",
     "RetryPolicy",
     "SQLiteEventStore",

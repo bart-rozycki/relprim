@@ -27,9 +27,11 @@ print(result.value)
 print(result.report.to_dict())
 ```
 
-`retries=3` means three retry attempts after the initial call.
+`retries=3` means three retry attempts after the initial call, so up to four
+attempts in total.
 
-`timeout=10` means each attempt is protected by a 10 second async timeout.
+`timeout=10` means each primary attempt is protected by a 10 second async
+timeout. All durations in RelPrim are expressed in seconds.
 
 The decorated function returns an `OperationResult[T]`.
 
@@ -40,7 +42,7 @@ result.report
 
 This keeps the business result and execution metadata explicit.
 
-## Prevent duplicate executions
+## Deduplicate repeated calls
 
 Use an idempotency key when the same logical request may be submitted more than once.
 
@@ -61,6 +63,11 @@ async def process_request(
 The first call executes the operation. Concurrent duplicate calls join it, and
 later calls replay its successful result.
 
+Idempotency does not guarantee exactly-once external side effects. If a call
+is cancelled or the process crashes after the side effect but before the result
+is cached, a later call executes again. For external mutations, also use the
+downstream service's own idempotency mechanism.
+
 The default store is in-memory and coordinates calls only within one Python
 process.
 
@@ -71,7 +78,8 @@ multi-process or distributed systems.
 
 By default, simple retries use `Exception`.
 
-For production code, prefer retrying specific transient errors.
+For production code, prefer retrying specific transient errors. `retry_on`
+requires `retries`; cancellation (`asyncio.CancelledError`) is never retried.
 
 ```python
 from relprim import resilient
@@ -174,7 +182,10 @@ async def call_provider(prompt: str) -> str:
 
 Validation failures are reported through the execution report.
 
-They can also participate in retry behavior when configured explicitly.
+A validation failure is an ordinary attempt failure (`ValidationFailedError`),
+so it is retried whenever it matches `retry_on`. The default
+`retry_on=(Exception,)` retries it. To retry only validation failures, or to
+exclude them, narrow `retry_on`:
 
 ```python
 from relprim import ValidationFailedError, resilient
@@ -309,6 +320,24 @@ The SQLite store is intended for local and single-host persistence.
 See the [SQLite event store guide](sqlite-event-store.md) for filters,
 pagination, retention and storage limitations.
 
+## Handle failures
+
+A decorated function raises `OperationExecutionError` when the operation fails
+after its retries and fallbacks. The execution report is attached:
+
+```python
+from relprim import OperationExecutionError
+
+try:
+    result = await call_provider("Write a short product summary")
+except OperationExecutionError as error:
+    print(error.cause)
+    print(error.report.to_dict())
+```
+
+Cancellation is never converted into a RelPrim error: cancelling the calling
+task raises `asyncio.CancelledError` without retries or fallbacks.
+
 ## Use advanced policies when you need control
 
 The simple decorator options are designed for fast adoption.
@@ -320,12 +349,17 @@ from relprim import RetryPolicy, TimeoutPolicy, resilient
 
 
 @resilient(
-    retry=RetryPolicy(max_attempts=3),
+    retry=RetryPolicy(max_attempts=4),
     timeout=TimeoutPolicy(seconds=10),
 )
 async def call_provider(prompt: str) -> str:
     return await provider.generate(prompt)
 ```
+
+`RetryPolicy(max_attempts=4)` is equivalent to `retries=3`: `max_attempts`
+counts the initial attempt. Each simple option and its policy counterpart are
+mutually exclusive. See the [API reference](api-reference.md#decorator) for
+the full mapping.
 
 ## When to use the builder API
 

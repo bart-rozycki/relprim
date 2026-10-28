@@ -189,6 +189,12 @@ database operation.
 A database created by a newer unsupported RelPrim schema version raises
 `SQLiteEventStoreSchemaError` instead of attempting an unsafe downgrade.
 
+Databases written by RelPrim 0.10 and 0.11 use schema version `1` and are
+read by 1.0 without migration. Within 1.x, databases remain readable by the
+same or a later release. Reading a database with an older release is not
+supported once a newer release has stored event types the older one does not
+know.
+
 ## Database format
 
 Structured events are stored with:
@@ -199,10 +205,12 @@ Structured events are stored with:
 - timezone-aware timestamp;
 - JSON payload.
 
-Event payloads must contain JSON-compatible scalar values.
+Event payloads contain JSON scalar values: strings, booleans, integers,
+finite floats and `None`. `StructuredEvent` already rejects anything else, so
+every RelPrim event can be stored and read back unchanged. Timestamps are
+stored in UTC with microsecond precision and read back as UTC.
 
-Non-finite floating-point values are rejected instead of being persisted as
-non-standard JSON.
+Queries use bound parameters only.
 
 ## Why `:memory:` is not supported
 
@@ -221,7 +229,17 @@ Use a temporary filesystem database for tests instead.
 Event delivery is explicit and awaited. RelPrim does not swallow sink failures
 or move persistence into a hidden background task.
 
-If SQLite event persistence fails, that sink error is visible to the caller.
+If SQLite event persistence fails, the `sqlite3` error propagates to the
+caller unchanged and the operation stops at that point. See
+[event delivery](events-and-metadata.md#event-delivery).
+
+## Cancellation
+
+SQLite work runs in a worker thread. Cancelling the task that awaits `emit()`,
+`history()` or `delete_before()` raises `asyncio.CancelledError` immediately,
+but the statement already running in the thread is not interrupted: an event
+being written may still be committed. Connections are always closed and the
+store remains usable.
 
 Applications that do not want event-storage failures to affect business
 operations should choose their event delivery architecture accordingly.

@@ -61,7 +61,7 @@ class Validator(Protocol[T_contra]):
 
 
 @dataclass(frozen=True, slots=True)
-class CallableValidator(Generic[T]):
+class CallableValidator(Generic[T_contra]):
     """Validator backed by a plain callable.
 
     The callable should return True when the value is acceptable and False when
@@ -73,7 +73,7 @@ class CallableValidator(Generic[T]):
     """
 
     name: str
-    predicate: Callable[[T], bool]
+    predicate: Callable[[T_contra], bool]
     message: str
 
     def __post_init__(self) -> None:
@@ -82,7 +82,7 @@ class CallableValidator(Generic[T]):
         if not self.message.strip():
             raise ValueError("message must not be empty.")
 
-    def validate(self, value: T) -> ValidationResult:
+    def validate(self, value: T_contra) -> ValidationResult:
         if self.predicate(value):
             return ValidationResult.success(validator_name=self.name)
 
@@ -93,17 +93,24 @@ class CallableValidator(Generic[T]):
 
 
 @dataclass(frozen=True, slots=True)
-class ValidationPolicy(Generic[T]):
+class ValidationPolicy(Generic[T_contra]):
     """Runs one or more validators against a value.
 
     Validators are executed in order. The first failed validator stops execution
-    and returns its failure result.
+    and its failure result is returned.
 
     This is fail-fast by design. It avoids doing extra validation work after the
     value is already known to be unacceptable.
+
+    When every validator passes, the success result of the last validator is
+    returned. Its `validator_name` therefore always names a validator that
+    actually ran.
+
+    ValidationPolicy is contravariant: a policy that accepts `object` can be
+    used wherever a policy for a more specific type is expected.
     """
 
-    validators: tuple[Validator[T], ...]
+    validators: tuple[Validator[T_contra], ...]
 
     def __post_init__(self) -> None:
         if not self.validators:
@@ -111,31 +118,33 @@ class ValidationPolicy(Generic[T]):
 
     @classmethod
     def from_validators(cls, *validators: Validator[T]) -> ValidationPolicy[T]:
-        return cls(validators=validators)
+        return ValidationPolicy(validators=validators)
 
-    def validate(self, value: T) -> ValidationResult:
+    def validate(self, value: T_contra) -> ValidationResult:
+        result: ValidationResult | None = None
+
         for validator in self.validators:
             result = validator.validate(value)
 
             if not result.valid:
                 return result
 
-        return ValidationResult.success(validator_name="validation_policy")
+        if result is None:
+            raise RuntimeError("ValidationPolicy has no validators.")
 
-    def validate_or_raise(self, value: T) -> None:
+        return result
+
+    def validate_or_raise(self, value: T_contra) -> ValidationResult:
+        """Validate a value, raising ValidationFailedError when it is invalid.
+
+        Returns the successful ValidationResult.
+        """
         result = self.validate(value)
 
-        if result.valid:
-            return
+        if not result.valid:
+            raise _validation_error(result)
 
-        if result.reason is None:
-            raise RuntimeError("Validation failed without a reason.")
-
-        raise ValidationFailedError(
-            f"Validation failed in '{result.validator_name}': {result.reason}",
-            validator_name=result.validator_name,
-            reason=result.reason,
-        )
+        return result
 
 
 def validator(
@@ -154,4 +163,14 @@ def validator(
 
 def validation_policy(*validators: Validator[T]) -> ValidationPolicy[T]:
     """Create a validation policy from validators."""
-    return ValidationPolicy.from_validators(*validators)
+    return ValidationPolicy(validators=validators)
+
+
+def _validation_error(result: ValidationResult) -> ValidationFailedError:
+    reason = result.reason or "Validation failed."
+
+    return ValidationFailedError(
+        f"Validation failed in '{result.validator_name}': {reason}",
+        validator_name=result.validator_name,
+        reason=reason,
+    )

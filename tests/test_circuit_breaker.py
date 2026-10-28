@@ -313,3 +313,36 @@ async def test_reset_closes_open_breaker() -> None:
 def test_circuit_breaker_rejects_invalid_configuration(kwargs: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         CircuitBreaker(**kwargs)
+
+
+def test_circuit_breakers_compare_by_identity_and_are_hashable() -> None:
+    first = CircuitBreaker(name="provider")
+    second = CircuitBreaker(name="provider")
+
+    assert first != second
+    assert first == first
+    assert len({first, second}) == 2
+
+
+@pytest.mark.parametrize("record_failure_on", [(BaseException,), (asyncio.CancelledError,)])
+def test_circuit_breaker_rejects_base_exception_types(
+    record_failure_on: tuple[type[BaseException], ...],
+) -> None:
+    with pytest.raises(TypeError, match="record_failure_on must contain Exception subclasses"):
+        CircuitBreaker(record_failure_on=record_failure_on)  # type: ignore[arg-type]
+
+
+async def test_open_error_exposes_state_enum() -> None:
+    breaker = CircuitBreaker(failure_threshold=1, record_failure_on=(TransientError,))
+
+    async def failing() -> None:
+        raise TransientError("down")
+
+    with pytest.raises(TransientError):
+        await breaker.run_async(failing)
+
+    with pytest.raises(CircuitBreakerOpenError) as exc_info:
+        await breaker.run_async(failing)
+
+    assert exc_info.value.state is CircuitBreakerState.OPEN
+    assert exc_info.value.breaker_name == "default"

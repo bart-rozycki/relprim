@@ -9,7 +9,11 @@ from relprim import (
     EventType,
     InMemoryEventSink,
     NoopEventSink,
+    OperationExecutionError,
+    RetryPolicy,
     StructuredEvent,
+    async_operation,
+    fallback_chain,
 )
 
 
@@ -171,3 +175,80 @@ async def test_event_emitter_uses_noop_sink_by_default() -> None:
 def test_event_emitter_requires_at_least_one_sink() -> None:
     with pytest.raises(ValueError):
         EventEmitter(sinks=())
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        ({"value": float("inf")}, ValueError),
+        ({"value": {"nested": True}}, TypeError),
+        ({"value": b"bytes"}, TypeError),
+    ],
+)
+def test_structured_event_payload_must_contain_json_scalars(
+    payload: dict[str, object],
+    error: type[Exception],
+) -> None:
+    with pytest.raises(error):
+        StructuredEvent(
+            event_type=EventType.OPERATION_STARTED,
+            operation_name="provider_call",
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            payload=payload,  # type: ignore[arg-type]
+        )
+
+
+class SinkFailure(Exception):
+    pass
+
+
+class FailingSink:
+    def __init__(self, fail_on: EventType) -> None:
+        self.fail_on = fail_on
+
+    async def emit(self, event: StructuredEvent) -> None:
+        if event.event_type is self.fail_on:
+            raise SinkFailure("storage unavailable")
+
+
+async def test_sink_failure_propagates_unchanged_and_stops_later_sinks() -> None:
+    later = InMemoryEventSink()
+    calls = 0
+    fallback_calls = 0
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+        return "ok"
+
+    async def fallback() -> str:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return "fallback"
+
+    configured = (
+        async_operation("provider_call", operation)
+        .with_retry(RetryPolicy(max_attempts=3))
+        .with_fallbacks(fallback_chain(("fallback", fallback)))
+        .with_events(EventEmitter(sinks=(FailingSink(EventType.ATTEMPT_SUCCEEDED), later)))
+    )
+
+    with pytest.raises(SinkFailure) as exc_info:
+        await configured.run()
+
+    # Sink failures are not operation failures: no retry, no fallback, no wrapping.
+    assert not isinstance(exc_info.value, OperationExecutionError)
+    assert calls == 1
+    assert fallback_calls == 0
+    assert EventType.ATTEMPT_SUCCEEDED not in {event.event_type for event in await later.events()}
+
+
+async def test_event_timestamps_are_timezone_aware() -> None:
+    sink = InMemoryEventSink()
+
+    async def operation() -> str:
+        return "ok"
+
+    await async_operation("provider_call", operation).with_events(EventEmitter(sinks=(sink,))).run()
+
+    assert all(event.timestamp.utcoffset() is not None for event in await sink.events())

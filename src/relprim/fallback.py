@@ -4,22 +4,24 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Generic, ParamSpec, TypeVar
 
+from relprim._checks import check_exception_types
 from relprim.errors import FallbackChainError
 
 P = ParamSpec("P")
 R = TypeVar("R")
+R_co = TypeVar("R_co", covariant=True)
 
 
 @dataclass(frozen=True, slots=True)
-class FallbackCandidate(Generic[P, R]):
+class FallbackCandidate(Generic[P, R_co]):
     """Single fallback candidate.
 
-    A candidate wraps an async callable with a stable name. The name is used for
-    debugging, reporting and future structured events.
+    A candidate wraps an async callable with a stable name. The name is used in
+    execution reports and structured events.
     """
 
     name: str
-    operation: Callable[P, Awaitable[R]]
+    operation: Callable[P, Awaitable[R_co]]
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -30,32 +32,40 @@ class FallbackCandidate(Generic[P, R]):
 class FallbackPolicy:
     """Fallback decision policy.
 
-    `fallback_on` defines which exceptions should trigger a fallback.
+    `fallback_on` defines which exceptions should trigger a fallback. It applies
+    both to the failure of the primary operation (inside AsyncOperation) and to
+    the failure of each candidate before the next one is tried.
 
     Non-matching exceptions are propagated immediately. This prevents RelPrim
     from accidentally hiding programmer errors, validation failures or other
     failures that should not be routed to another provider.
+
+    `fallback_on` must contain Exception subclasses; cancellation never
+    triggers a fallback.
     """
 
-    fallback_on: tuple[type[BaseException], ...] = (Exception,)
+    fallback_on: tuple[type[Exception], ...] = (Exception,)
 
     def __post_init__(self) -> None:
-        if not self.fallback_on:
-            raise ValueError("fallback_on must contain at least one exception type.")
+        check_exception_types(self.fallback_on, "fallback_on")
 
     def should_fallback(self, exception: BaseException) -> bool:
         return isinstance(exception, self.fallback_on)
 
 
 @dataclass(frozen=True, slots=True)
-class FallbackResult(Generic[R]):
-    """Result returned by a successful fallback chain execution."""
+class FallbackResult(Generic[R_co]):
+    """Result returned by a successful fallback chain execution.
 
-    value: R
+    `failures` contains the exceptions of the candidates that failed before the
+    successful one, in candidate order.
+    """
+
+    value: R_co
     candidate_name: str
     candidate_index: int
     fallback_used: bool
-    failures: tuple[BaseException, ...]
+    failures: tuple[Exception, ...]
 
     @property
     def failure_count(self) -> int:
@@ -63,7 +73,7 @@ class FallbackResult(Generic[R]):
 
 
 @dataclass(frozen=True, slots=True)
-class FallbackChain(Generic[P, R]):
+class FallbackChain(Generic[P, R_co]):
     """Async fallback chain for external operations.
 
     The chain tries candidates in order and returns the first successful result.
@@ -73,7 +83,7 @@ class FallbackChain(Generic[P, R]):
     APIs.
     """
 
-    candidates: tuple[FallbackCandidate[P, R], ...]
+    candidates: tuple[FallbackCandidate[P, R_co], ...]
     policy: FallbackPolicy = FallbackPolicy()
 
     def __post_init__(self) -> None:
@@ -91,14 +101,14 @@ class FallbackChain(Generic[P, R]):
             FallbackCandidate(name=name, operation=operation) for name, operation in operations
         )
 
-        return cls(
+        return FallbackChain(
             candidates=candidates,
             policy=policy or FallbackPolicy(),
         )
 
-    async def run(self, *args: P.args, **kwargs: P.kwargs) -> FallbackResult[R]:
+    async def run(self, *args: P.args, **kwargs: P.kwargs) -> FallbackResult[R_co]:
         """Run candidates in order and return the first successful result."""
-        failures: list[BaseException] = []
+        failures: list[Exception] = []
 
         for candidate_index, candidate in enumerate(self.candidates):
             try:

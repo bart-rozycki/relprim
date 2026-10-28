@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import ParamSpec, TypeVar
 
+from relprim._checks import check_exception_types, check_seconds
 from relprim.errors import RetryError
 
 P = ParamSpec("P")
@@ -14,16 +16,6 @@ R = TypeVar("R")
 
 SyncSleeper = Callable[[float], None]
 AsyncSleeper = Callable[[float], Awaitable[None]]
-
-
-@dataclass(frozen=True, slots=True)
-class RetryAttempt:
-    """Information about a single retry attempt."""
-
-    attempt_number: int
-    max_attempts: int
-    exception: BaseException
-    delay_seconds: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,12 +36,13 @@ class ExponentialBackoff:
     jitter: bool = True
 
     def __post_init__(self) -> None:
-        if self.base_delay_seconds < 0:
-            raise ValueError("base_delay_seconds must be greater than or equal to 0.")
-        if self.max_delay_seconds < 0:
-            raise ValueError("max_delay_seconds must be greater than or equal to 0.")
-        if self.multiplier < 1:
-            raise ValueError("multiplier must be greater than or equal to 1.")
+        check_seconds(self.base_delay_seconds, "base_delay_seconds", allow_zero=True)
+        check_seconds(self.max_delay_seconds, "max_delay_seconds", allow_zero=True)
+
+        if isinstance(self.multiplier, bool) or not isinstance(self.multiplier, int | float):
+            raise TypeError("multiplier must be an int or float.")
+        if not math.isfinite(self.multiplier) or self.multiplier < 1:
+            raise ValueError("multiplier must be a finite number greater than or equal to 1.")
         if self.base_delay_seconds > self.max_delay_seconds:
             raise ValueError("base_delay_seconds must not exceed max_delay_seconds.")
 
@@ -63,7 +56,11 @@ class ExponentialBackoff:
         if retry_number < 1:
             raise ValueError("retry_number must be greater than or equal to 1.")
 
-        delay = self.base_delay_seconds * (self.multiplier ** (retry_number - 1))
+        try:
+            delay = self.base_delay_seconds * (self.multiplier ** (retry_number - 1))
+        except OverflowError:
+            delay = self.max_delay_seconds
+
         delay = min(delay, self.max_delay_seconds)
 
         if self.jitter and delay > 0:
@@ -82,19 +79,25 @@ class RetryPolicy:
     It only answers one question:
 
     "Should this operation be retried, and if yes, when?"
+
+    `max_attempts` is the total number of attempts, including the initial one.
+    `retry_on` must contain Exception subclasses; cancellation
+    (asyncio.CancelledError) and other BaseException subclasses are never
+    retried.
     """
 
     max_attempts: int = 3
     backoff: ExponentialBackoff = ExponentialBackoff()
-    retry_on: tuple[type[BaseException], ...] = (Exception,)
+    retry_on: tuple[type[Exception], ...] = (Exception,)
     sleeper: SyncSleeper = time.sleep
     async_sleeper: AsyncSleeper = asyncio.sleep
 
     def __post_init__(self) -> None:
+        if isinstance(self.max_attempts, bool) or not isinstance(self.max_attempts, int):
+            raise TypeError("max_attempts must be an int.")
         if self.max_attempts < 1:
             raise ValueError("max_attempts must be greater than or equal to 1.")
-        if not self.retry_on:
-            raise ValueError("retry_on must contain at least one exception type.")
+        check_exception_types(self.retry_on, "retry_on")
 
     def run(
         self,
@@ -103,7 +106,7 @@ class RetryPolicy:
         **kwargs: P.kwargs,
     ) -> R:
         """Run a synchronous operation with retry handling."""
-        last_exception: BaseException | None = None
+        last_exception: Exception | None = None
 
         for attempt_number in range(1, self.max_attempts + 1):
             try:
@@ -133,7 +136,7 @@ class RetryPolicy:
         **kwargs: P.kwargs,
     ) -> R:
         """Run an asynchronous operation with retry handling."""
-        last_exception: BaseException | None = None
+        last_exception: Exception | None = None
 
         for attempt_number in range(1, self.max_attempts + 1):
             try:

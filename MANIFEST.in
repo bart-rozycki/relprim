@@ -1,0 +1,4 @@
+graft docs
+graft examples
+graft tests
+global-exclude *.py[cod] __pycache__ *.db *.db-wal *.db-shm .DS_Store

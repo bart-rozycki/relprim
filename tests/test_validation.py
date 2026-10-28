@@ -134,8 +134,9 @@ def test_validation_policy_returns_success_when_all_validators_pass() -> None:
 
     result = policy.validate("hello")
 
+    # The last validator that ran is reported; every validator passed.
     assert result.valid is True
-    assert result.validator_name == "validation_policy"
+    assert result.validator_name == "short_enough"
     assert result.reason is None
 
 
@@ -240,3 +241,26 @@ def test_validation_policy_accepts_custom_validator_object() -> None:
     assert result.valid is False
     assert result.validator_name == "starts_with_prefix"
     assert result.reason == "Value must start with 'rel'."
+
+
+def test_single_validator_success_reports_that_validator() -> None:
+    policy = validation_policy(validator("positive", lambda value: value > 0, message="m"))
+
+    assert policy.validate(1) == ValidationResult.success(validator_name="positive")
+
+
+def test_later_validator_failure_is_reported() -> None:
+    policy = validation_policy(
+        validator("positive", lambda value: value > 0, message="must be positive"),
+        validator("even", lambda value: value % 2 == 0, message="must be even"),
+    )
+
+    result = policy.validate(3)
+
+    assert result == ValidationResult.failure(validator_name="even", reason="must be even")
+
+
+def test_validate_or_raise_returns_successful_result() -> None:
+    policy = validation_policy(validator("positive", lambda value: value > 0, message="m"))
+
+    assert policy.validate_or_raise(1).validator_name == "positive"

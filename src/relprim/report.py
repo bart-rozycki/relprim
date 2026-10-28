@@ -7,17 +7,21 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import TypeAlias
 
-JsonScalar: TypeAlias = str | int | float | bool | None
+from relprim._checks import JsonScalar, check_aware, check_seconds, freeze_json_scalars
+
 Metadata: TypeAlias = Mapping[str, JsonScalar]
 
 
 class ExecutionStatus(StrEnum):
-    """Final status of an operation execution."""
+    """Final status of an operation execution.
+
+    Cancellation is not a status: a cancelled operation propagates
+    asyncio.CancelledError and produces no report.
+    """
 
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     TIMED_OUT = "timed_out"
-    CANCELLED = "cancelled"
 
 
 class AttemptStatus(StrEnum):
@@ -26,15 +30,10 @@ class AttemptStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     TIMED_OUT = "timed_out"
-    CANCELLED = "cancelled"
 
 
 def _empty_metadata() -> Metadata:
     return MappingProxyType({})
-
-
-def _freeze_metadata(metadata: Mapping[str, JsonScalar] | None) -> Metadata:
-    return MappingProxyType(dict(metadata or {}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +77,11 @@ class ExecutionError:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionAttempt:
-    """Report entry for a single execution attempt."""
+    """Report entry for a single execution attempt.
+
+    `fallback` is True for the attempt that ran the fallback chain after the
+    primary operation failed. Fallback attempts are not counted as retries.
+    """
 
     attempt_number: int
     status: AttemptStatus
@@ -86,16 +89,17 @@ class ExecutionAttempt:
     duration_seconds: float
     error: ExecutionError | None = None
     metadata: Metadata = field(default_factory=_empty_metadata)
+    fallback: bool = False
 
     def __post_init__(self) -> None:
         if self.attempt_number < 1:
             raise ValueError("attempt_number must be greater than or equal to 1.")
-        if self.duration_seconds < 0:
-            raise ValueError("duration_seconds must be greater than or equal to 0.")
+        check_seconds(self.duration_seconds, "duration_seconds", allow_zero=True)
         if self.status is AttemptStatus.SUCCEEDED and self.error is not None:
             raise ValueError("successful attempts must not contain an error.")
 
-        object.__setattr__(self, "metadata", _freeze_metadata(self.metadata))
+        check_aware(self.started_at, "started_at")
+        object.__setattr__(self, "metadata", freeze_json_scalars(self.metadata, "metadata"))
 
     @property
     def succeeded(self) -> bool:
@@ -113,6 +117,7 @@ class ExecutionAttempt:
             "duration_seconds": self.duration_seconds,
             "error": self.error.to_dict() if self.error is not None else None,
             "metadata": dict(self.metadata),
+            "fallback": self.fallback,
         }
 
 
@@ -135,8 +140,7 @@ class ExecutionReport:
     def __post_init__(self) -> None:
         if not self.operation_name.strip():
             raise ValueError("operation_name must not be empty.")
-        if self.duration_seconds < 0:
-            raise ValueError("duration_seconds must be greater than or equal to 0.")
+        check_seconds(self.duration_seconds, "duration_seconds", allow_zero=True)
         if not self.attempts:
             raise ValueError("attempts must contain at least one execution attempt.")
 
@@ -154,7 +158,9 @@ class ExecutionReport:
         ):
             raise ValueError("failed reports must not end with a successful attempt.")
 
-        object.__setattr__(self, "metadata", _freeze_metadata(self.metadata))
+        check_aware(self.started_at, "started_at")
+        object.__setattr__(self, "attempts", tuple(self.attempts))
+        object.__setattr__(self, "metadata", freeze_json_scalars(self.metadata, "metadata"))
 
     @property
     def succeeded(self) -> bool:
@@ -170,7 +176,12 @@ class ExecutionReport:
 
     @property
     def retry_count(self) -> int:
-        return max(0, self.attempt_count - 1)
+        """Number of primary attempts after the first one.
+
+        Fallback attempts are not retries and are not counted.
+        """
+        primary_attempts = sum(1 for attempt in self.attempts if not attempt.fallback)
+        return max(0, primary_attempts - 1)
 
     @property
     def retried(self) -> bool:

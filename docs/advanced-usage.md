@@ -51,6 +51,18 @@ result = await (
 
 Fallback candidate names appear in reports and structured events.
 
+Fallback semantics:
+
+* The chain runs once, after the final primary attempt failed and only if the
+  chain's `FallbackPolicy` matches that failure (`Exception` by default).
+* Candidates are tried in order. Each candidate's result is validated with
+  the operation's validation policy; an invalid result counts as a candidate
+  failure, so the next candidate is tried.
+* Candidates are not retried and run without the operation's timeout policy or
+  circuit breaker. Wrap a candidate yourself if it needs its own timeout.
+* The fallback is recorded as one additional attempt with
+  `ExecutionAttempt.fallback=True`. It is not counted in `retry_count`.
+
 ## Circuit breakers
 
 Circuit breakers protect overloaded or unhealthy downstream systems.
@@ -72,6 +84,15 @@ result = await (
     .run("Write a short product summary")
 )
 ```
+
+Every primary attempt is one breaker call, including its timeout and
+validation. Validation failures and timeouts therefore count as failures when
+they match `record_failure_on`. Rejected calls fail with
+`CircuitBreakerOpenError`, which is retryable and can fall back like any other
+failure.
+
+Share one `CircuitBreaker` instance between every operation that should share
+failure accounting. Cancelled calls are neither failures nor successes.
 
 ## Rate-limit handling
 
@@ -222,6 +243,11 @@ for event in await event_sink.events():
 
 Events are transport-agnostic. They can be sent to logs, in-memory sinks, SQLite stores, OpenTelemetry exporters or custom observability systems.
 
+Sinks are awaited inline. A sink that raises stops the operation and its
+exception reaches the caller unchanged. See
+[structured events and metadata](events-and-metadata.md) for every event,
+payload key and the exact delivery semantics.
+
 ## OpenTelemetry event export
 
 Use `OpenTelemetryEventSink` to add RelPrim events to the currently active
@@ -335,6 +361,7 @@ result = await (
     .run("request-123", 2499)
 )
 ```
+
 Idempotency wraps the full retry, timeout, validation and fallback flow.
 
 The in-memory store is limited to one process. See the [idempotency guide](idempotency.md) for key design, concurrency semantics and storage limitations.
@@ -378,4 +405,11 @@ result = await (
 )
 ```
 
-Both APIs use the same underlying primitives.
+Both APIs use the same underlying primitives. Every builder method returns a
+new operation and leaves the original unchanged; the order of the calls does
+not matter. The [API reference](api-reference.md#builder) documents the fixed
+execution order.
+
+The builder also gives the strongest static typing: `with_validation`,
+`with_fallbacks` and `with_idempotency` are checked against the operation's
+parameters and return type, while the decorator checks them at runtime.

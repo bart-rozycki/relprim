@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypeAlias
 
+from relprim._checks import check_exception_types, check_seconds
 from relprim.errors import RetryAfterExtractionError
 
 RetryAfterExtractor: TypeAlias = Callable[[Exception], float | None]
@@ -45,6 +46,11 @@ class RateLimitPolicy:
 
     It does not decide how many retries are allowed. Retry count remains the
     responsibility of RetryPolicy.
+
+    `max_wait_seconds` bounds the delay selected before the next attempt,
+    whether that delay came from the provider hint or from the retry policy's
+    backoff. A larger selected delay skips the retry and continues into
+    fallback or final failure.
     """
 
     rate_limit_on: tuple[type[Exception], ...]
@@ -52,14 +58,8 @@ class RateLimitPolicy:
     max_wait_seconds: float = 60.0
 
     def __post_init__(self) -> None:
-        if not self.rate_limit_on:
-            raise ValueError("rate_limit_on must contain at least one exception type.")
-
-        for exception_type in self.rate_limit_on:
-            if not isinstance(exception_type, type) or not issubclass(exception_type, Exception):
-                raise TypeError("rate_limit_on must contain Exception subclasses.")
-
-        _validate_max_wait(self.max_wait_seconds)
+        check_exception_types(self.rate_limit_on, "rate_limit_on")
+        check_seconds(self.max_wait_seconds, "max_wait_seconds", allow_zero=True)
 
     def evaluate(self, exception: Exception) -> RateLimitDecision:
         """Evaluate whether an exception represents a rate-limit response."""
@@ -129,14 +129,3 @@ def _validate_retry_after(
         )
 
     return retry_after_seconds
-
-
-def _validate_max_wait(value: object) -> None:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise TypeError("max_wait_seconds must be an int or float.")
-
-    if not math.isfinite(float(value)):
-        raise ValueError("max_wait_seconds must be finite.")
-
-    if value < 0:
-        raise ValueError("max_wait_seconds must be greater than or equal to 0.")

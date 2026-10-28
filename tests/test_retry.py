@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from relprim import ExponentialBackoff, RetryError, RetryPolicy
@@ -306,3 +308,60 @@ async def test_run_async_uses_expected_backoff_delays() -> None:
         await policy.run_async(operation)
 
     assert delays == [0.25, 0.5]
+
+
+@pytest.mark.parametrize(
+    "retry_on",
+    [(BaseException,), (asyncio.CancelledError,), (KeyboardInterrupt,), (Exception, SystemExit)],
+)
+def test_retry_policy_rejects_base_exception_types(
+    retry_on: tuple[type[BaseException], ...],
+) -> None:
+    with pytest.raises(TypeError, match="retry_on must contain Exception subclasses"):
+        RetryPolicy(retry_on=retry_on)  # type: ignore[arg-type]
+
+
+async def test_run_async_never_retries_cancellation() -> None:
+    calls = 0
+
+    async def no_sleep(delay: float) -> None:
+        return None
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await RetryPolicy(max_attempts=3, async_sleeper=no_sleep).run_async(operation)
+
+    assert calls == 1
+
+
+def test_retry_policy_rejects_bool_max_attempts() -> None:
+    with pytest.raises(TypeError, match="max_attempts must be an int"):
+        RetryPolicy(max_attempts=True)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"base_delay_seconds": float("nan")}, "base_delay_seconds must be finite"),
+        ({"max_delay_seconds": float("inf")}, "max_delay_seconds must be finite"),
+        ({"multiplier": float("nan")}, "multiplier must be a finite number"),
+    ],
+)
+def test_backoff_rejects_non_finite_configuration(kwargs: dict[str, float], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        ExponentialBackoff(**kwargs)
+
+
+def test_backoff_caps_delay_instead_of_overflowing() -> None:
+    backoff = ExponentialBackoff(
+        base_delay_seconds=1.0,
+        max_delay_seconds=30.0,
+        multiplier=10.0,
+        jitter=False,
+    )
+
+    assert backoff.delay_for_retry(10_000) == 30.0

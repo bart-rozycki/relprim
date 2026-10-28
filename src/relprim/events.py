@@ -8,7 +8,8 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Protocol, TypeAlias
 
-JsonScalar: TypeAlias = str | int | float | bool | None
+from relprim._checks import JsonScalar, check_aware, freeze_json_scalars
+
 EventPayload: TypeAlias = Mapping[str, JsonScalar]
 TimestampFactory: TypeAlias = Callable[[], datetime]
 
@@ -47,10 +48,6 @@ def _empty_payload() -> EventPayload:
     return MappingProxyType({})
 
 
-def _freeze_payload(payload: Mapping[str, JsonScalar] | None) -> EventPayload:
-    return MappingProxyType(dict(payload or {}))
-
-
 @dataclass(frozen=True, slots=True)
 class StructuredEvent:
     """Immutable structured event emitted by RelPrim.
@@ -69,10 +66,9 @@ class StructuredEvent:
         if not self.operation_name.strip():
             raise ValueError("operation_name must not be empty.")
 
-        if self.timestamp.tzinfo is None:
-            raise ValueError("timestamp must be timezone-aware.")
+        check_aware(self.timestamp, "timestamp")
 
-        object.__setattr__(self, "payload", _freeze_payload(self.payload))
+        object.__setattr__(self, "payload", freeze_json_scalars(self.payload, "payload"))
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -84,7 +80,11 @@ class StructuredEvent:
 
 
 class EventSink(Protocol):
-    """Protocol implemented by async structured event sinks."""
+    """Protocol implemented by async structured event sinks.
+
+    emit() is awaited inline by EventEmitter. Exceptions raised by a sink
+    propagate to the caller of the RelPrim operation unchanged.
+    """
 
     async def emit(self, event: StructuredEvent) -> None:
         """Persist, export or forward a structured event."""
@@ -98,7 +98,7 @@ class NoopEventSink:
         return None
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class InMemoryEventSink:
     """In-memory event sink for tests, demos and local inspection.
 
@@ -126,12 +126,15 @@ class EventEmitter:
     """Small structured event emitter.
 
     EventEmitter creates immutable StructuredEvent objects and forwards them to
-    configured sinks.
+    configured sinks, awaiting each sink in order.
 
     It intentionally does not run hidden background tasks, swallow sink errors or
-    buffer events implicitly. If a sink fails, the caller sees that failure.
-    Higher-level integrations may later decide whether event delivery failures
-    should fail the operation or be isolated.
+    buffer events implicitly. If a sink raises, the exception propagates to the
+    caller unchanged and later sinks do not receive that event. Inside an
+    AsyncOperation this aborts the operation at that point; sink failures are
+    never retried, never trigger fallbacks and are never wrapped in
+    OperationExecutionError. Applications that want observability failures
+    isolated from business operations should wrap their sink accordingly.
     """
 
     sinks: tuple[EventSink, ...] = field(default_factory=lambda: (NoopEventSink(),))

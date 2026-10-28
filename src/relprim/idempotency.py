@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Generic, ParamSpec, Protocol, TypeAlias, TypeVar, cast
 
+from relprim._checks import check_seconds
 from relprim.errors import IdempotencyReentryError
 
 P = ParamSpec("P")
@@ -25,7 +26,11 @@ class IdempotencyStatus(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class IdempotencyResult(Generic[R]):
-    """Value returned by an idempotent operation."""
+    """Value returned by an idempotent operation.
+
+    `key` is the caller's own idempotency key. RelPrim never copies it into
+    execution reports or structured events.
+    """
 
     value: R
     key: str
@@ -55,7 +60,15 @@ class IdempotencyResult(Generic[R]):
 
 
 class IdempotencyStore(Protocol):
-    """Storage and coordination interface for idempotent execution."""
+    """Storage and coordination interface for idempotent execution.
+
+    Implementations must:
+
+    - execute `operation` at most once at a time per key;
+    - let concurrent callers of an in-flight key share its outcome (`joined`);
+    - replay successful results until `ttl_seconds` have elapsed (`replayed`);
+    - never cache failures or cancellations.
+    """
 
     async def execute(
         self,
@@ -67,6 +80,10 @@ class IdempotencyStore(Protocol):
         """Execute or reuse an operation associated with an idempotency key."""
 
 
+class _OwnerCancelled(Exception):
+    """Delivered to joined callers when the owning caller was cancelled."""
+
+
 @dataclass(slots=True)
 class _Entry:
     future: asyncio.Future[object]
@@ -74,14 +91,25 @@ class _Entry:
     expires_at: float | None = None
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class InMemoryIdempotencyStore:
     """Single-process idempotency store for asyncio applications.
 
-    The store coordinates concurrent calls inside one Python process.
+    The store coordinates concurrent calls inside one Python process and one
+    event loop.
 
-    Successful results are retained until their TTL expires. Failures are not
-    cached, allowing later calls to retry the operation.
+    Successful results are retained until their TTL expires: an entry whose
+    expiry time is less than or equal to the store clock is expired. Expired
+    entries are removed lazily on the next execute(), purge_expired() or
+    entry_count() call; the store runs no background cleanup.
+
+    Failures are not cached: the failure is delivered to the owner and to every
+    joined caller, and the key is released so a later call executes again.
+
+    If the owning caller is cancelled, the key is released and joined callers
+    compete for it again: one becomes the new owner and executes the
+    operation, the others join it. Cancelling a joined caller never cancels
+    the shared execution.
 
     This store is suitable for tests, local applications and single-process
     services. Distributed applications should use a persistent shared store.
@@ -103,30 +131,33 @@ class InMemoryIdempotencyStore:
 
         current_task = cast(asyncio.Task[object] | None, asyncio.current_task())
 
-        async with self._lock:
-            self._purge_expired_locked(self.clock())
+        while True:
+            async with self._lock:
+                self._purge_expired_locked(self.clock())
 
-            entry = self._entries.get(validated_key)
+                entry = self._entries.get(validated_key)
 
-            if entry is not None:
+                if entry is None:
+                    future = asyncio.get_running_loop().create_future()
+                    self._entries[validated_key] = _Entry(
+                        future=future,
+                        owner_task=current_task,
+                    )
+                    break
+
                 if not entry.future.done() and entry.owner_task is current_task:
                     raise IdempotencyReentryError(validated_key)
 
-                future = entry.future
-                status = IdempotencyStatus.REPLAYED if future.done() else IdempotencyStatus.JOINED
-                owns_execution = False
-            else:
-                future = asyncio.get_running_loop().create_future()
-                entry = _Entry(
-                    future=future,
-                    owner_task=current_task,
-                )
-                self._entries[validated_key] = entry
-                status = IdempotencyStatus.EXECUTED
-                owns_execution = True
+                joined_future = entry.future
 
-        if not owns_execution:
-            value = cast(R, await asyncio.shield(future))
+            status = (
+                IdempotencyStatus.REPLAYED if joined_future.done() else IdempotencyStatus.JOINED
+            )
+
+            try:
+                value = cast(R, await asyncio.shield(joined_future))
+            except _OwnerCancelled:
+                continue
 
             return IdempotencyResult(
                 value=value,
@@ -137,14 +168,17 @@ class InMemoryIdempotencyStore:
         try:
             value = await operation()
         except asyncio.CancelledError:
-            await self._remove_entry(validated_key, future)
+            # Release the key synchronously so it is never left occupied, even
+            # if this task is cancelled again while cleaning up.
+            self._remove_entry_now(validated_key, future)
 
             if not future.done():
-                future.cancel()
+                future.set_exception(_OwnerCancelled())
+                future.exception()
 
             raise
         except Exception as exc:
-            await self._remove_entry(validated_key, future)
+            self._remove_entry_now(validated_key, future)
 
             if not future.done():
                 future.set_exception(exc)
@@ -156,14 +190,15 @@ class InMemoryIdempotencyStore:
 
             raise
 
-        async with self._lock:
-            current_entry = self._entries.get(validated_key)
+        # Publish the result synchronously: there is no await between the
+        # operation completing and joined callers being released.
+        current_entry = self._entries.get(validated_key)
 
-            if current_entry is not None and current_entry.future is future:
-                current_entry.expires_at = self.clock() + ttl_seconds
+        if current_entry is not None and current_entry.future is future:
+            current_entry.expires_at = self.clock() + ttl_seconds
 
-            if not future.done():
-                future.set_result(value)
+        if not future.done():
+            future.set_result(value)
 
         return IdempotencyResult(
             value=value,
@@ -182,16 +217,17 @@ class InMemoryIdempotencyStore:
             self._purge_expired_locked(self.clock())
             return len(self._entries)
 
-    async def _remove_entry(
+    def _remove_entry_now(
         self,
         key: str,
         future: asyncio.Future[object],
     ) -> None:
-        async with self._lock:
-            entry = self._entries.get(key)
+        # No critical section awaits while holding the lock, so this
+        # synchronous removal cannot interleave with one.
+        entry = self._entries.get(key)
 
-            if entry is not None and entry.future is future:
-                del self._entries[key]
+        if entry is not None and entry.future is future:
+            del self._entries[key]
 
     def _purge_expired_locked(self, now: float) -> int:
         expired_keys = [
@@ -208,7 +244,12 @@ class InMemoryIdempotencyStore:
 
 @dataclass(frozen=True, slots=True)
 class IdempotencyPolicy(Generic[P]):
-    """Derives an idempotency key and coordinates operation execution."""
+    """Derives an idempotency key and coordinates operation execution.
+
+    `key_factory` receives the same arguments as the operation and must return
+    a non-blank string. Exceptions raised by the key factory propagate
+    unchanged.
+    """
 
     key_factory: Callable[P, str]
     store: IdempotencyStore = field(default_factory=InMemoryIdempotencyStore)
@@ -263,8 +304,4 @@ def _validate_key(key: object) -> str:
 
 
 def _validate_ttl(ttl_seconds: float) -> None:
-    if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int | float):
-        raise TypeError("ttl_seconds must be an int or float.")
-
-    if ttl_seconds <= 0:
-        raise ValueError("ttl_seconds must be greater than 0.")
+    check_seconds(ttl_seconds, "ttl_seconds", allow_zero=False)

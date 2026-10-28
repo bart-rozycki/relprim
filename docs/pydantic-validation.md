@@ -188,7 +188,9 @@ structured validation events.
 
 ## Dependency model
 
-Pydantic is an optional dependency.
+Pydantic is an optional dependency. Pydantic v2 is supported
+(`>=2.0.0,<3.0.0`); the minimum version is tested in CI. Newer Python
+versions may require a newer Pydantic release than 2.0.
 
 `import relprim` never imports it. Only `relprim.pydantic` requires it, so the
 core package remains dependency-free.
