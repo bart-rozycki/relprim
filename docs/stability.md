@@ -59,6 +59,5 @@ considered breaking.
 
 ## Supported Python versions
 
-RelPrim supports the CPython versions listed in the package classifiers. Each
-supported version is tested in CI with the base install and all optional
-extras.
+RelPrim supports Python 3.11–3.14. Each supported version is tested with the
+base install and all optional extras.

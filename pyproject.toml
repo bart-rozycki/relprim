@@ -111,6 +111,7 @@ asyncio_mode = "auto"
 
 [project.urls]
 Homepage = "https://github.com/bart-rozycki/relprim"
+Documentation = "https://bartrozycki.com/relprim"
 Repository = "https://github.com/bart-rozycki/relprim"
 Issues = "https://github.com/bart-rozycki/relprim/issues"
 Changelog = "https://github.com/bart-rozycki/relprim/releases"

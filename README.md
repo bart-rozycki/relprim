@@ -9,6 +9,8 @@ Reliability primitives for operations that cross process, network or provider bo
 
 RelPrim helps you wrap external calls with retries, timeouts, fallbacks, validation, circuit breakers, idempotency, provider-aware rate-limit recovery, execution reports and structured events.
 
+Documentation: [bartrozycki.com/relprim](https://bartrozycki.com/relprim) · [Examples](https://bartrozycki.com/relprim/examples)
+
 ## Install
 
 ```bash
@@ -312,7 +314,7 @@ exported attributes and limitations.
 
 ## Examples
 
-Practical examples are available in the [`examples`](https://github.com/bart-rozycki/relprim/tree/main/examples) directory:
+Practical examples are available in the [`examples`](https://github.com/bart-rozycki/relprim/tree/main/examples) directory, and as walkthroughs organized by problem in the [documentation](https://bartrozycki.com/relprim/examples):
 
 * [`decorator_usage.py`](https://github.com/bart-rozycki/relprim/blob/main/examples/decorator_usage.py) — beginner-friendly decorator API
 * [`basic_resilience.py`](https://github.com/bart-rozycki/relprim/blob/main/examples/basic_resilience.py) — retry, timeout and execution reports
@@ -342,6 +344,10 @@ PYTHONPATH=src python examples/decorator_usage.py
 
 ## Documentation
 
+The full documentation, including scenario-based [examples](https://bartrozycki.com/relprim/examples), is at [bartrozycki.com/relprim](https://bartrozycki.com/relprim).
+
+Source-level guides in this repository:
+
 * [Getting started](https://github.com/bart-rozycki/relprim/blob/main/docs/getting-started.md)
 * [Advanced usage](https://github.com/bart-rozycki/relprim/blob/main/docs/advanced-usage.md)
 * [Idempotency](https://github.com/bart-rozycki/relprim/blob/main/docs/idempotency.md)
@@ -365,7 +371,7 @@ event identifiers and documented metadata keys only change incompatibly in a
 new major release. Underscore-prefixed names and undocumented internals are not
 part of that promise. See [stability and versioning](https://github.com/bart-rozycki/relprim/blob/main/docs/stability.md).
 
-RelPrim supports CPython 3.11 to 3.14.
+RelPrim supports Python 3.11–3.14.
 
 ## Design principles
 
